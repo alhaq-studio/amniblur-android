@@ -1,0 +1,6 @@
+{
+  "name": "AmnGaze (AI-Powered Gaze Protection)",
+  "description": "On-device AI-powered visual shield protecting you by detecting explicit content and blurring it in real-time.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

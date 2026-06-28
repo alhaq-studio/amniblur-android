@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AmnGaze</string>
+    <string name="accessibility_service_description">AmnGaze monitors active web browsers to detect inappropriate websites and automatically apply real-time blur protection overlays.</string>
+</resources>

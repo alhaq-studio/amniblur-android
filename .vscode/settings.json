@@ -1,0 +1,4 @@
+{
+  "gradle.useGradleWrapper": true,
+  "java.import.gradle.wrapper.enabled": true
+}
