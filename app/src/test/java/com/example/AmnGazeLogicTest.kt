@@ -471,7 +471,8 @@ class AmnGazeLogicTest {
         )
         assertTrue(frame3Regions.isEmpty())
 
-        // Also verify Accessibility TYPE_VIEW_SCROLLED immediately clears active regions
+        // Verify onScrollDetected(0f) retains active regions (zero-delta scroll events must not wipe boxes),
+        // while a large scroll (>= 0.35f) immediately clears active regions
         tracker.updateRegions(
             candidates = listOf(candidate),
             exteriorDiff = 0.20f,
@@ -482,6 +483,8 @@ class AmnGazeLogicTest {
         )
         assertEquals(1, tracker.getActiveRegions().size)
         tracker.onScrollDetected(0f)
+        assertEquals(1, tracker.getActiveRegions().size)
+        tracker.onScrollDetected(0.50f)
         assertTrue(tracker.getActiveRegions().isEmpty())
     }
 
@@ -622,6 +625,348 @@ class AmnGazeLogicTest {
                 usageSecondsMap = usageMap
             )
         )
+    }
+
+    @Test
+    fun testEffectStrengthSolidnessAndDensityCurveReachesOpaque255() = runBlocking {
+        // 1/10 is translucent (~45%, alpha=115)
+        assertEquals(115, HaramBlurFilterLogic.computeOverlayAlpha(1))
+        assertEquals(45, HaramBlurFilterLogic.computeOverlaySolidnessPercent(1))
+        assertEquals(0f, HaramBlurFilterLogic.computeDensityFactor(1), 0.001f)
+
+        // 5/10 is medium dense (~77%, alpha=196)
+        assertEquals(196, HaramBlurFilterLogic.computeOverlayAlpha(5))
+        assertTrue(HaramBlurFilterLogic.computeOverlayAlpha(5) > HaramBlurFilterLogic.computeOverlayAlpha(2))
+
+        // 9/10 and 10/10 are 100% solid opaque (alpha=255, zero see-through)
+        assertEquals(255, HaramBlurFilterLogic.computeOverlayAlpha(9))
+        assertEquals(255, HaramBlurFilterLogic.computeOverlayAlpha(10))
+        assertEquals(100, HaramBlurFilterLogic.computeOverlaySolidnessPercent(9))
+        assertEquals(100, HaramBlurFilterLogic.computeOverlaySolidnessPercent(10))
+        assertEquals(1f, HaramBlurFilterLogic.computeDensityFactor(10), 0.001f)
+
+        // Verify all overlay styles reach alpha 0xFF (255) at strength 10
+        for (style in HaramBlurOverlayStyle.entries) {
+            val colorAt10 = HaramBlurFilterLogic.overlayColorArgb(style, 10)
+            val alphaAt10 = (colorAt10 ushr 24) and 0xFF
+            assertEquals("Style $style must be 100% opaque (alpha=255) at 10/10", 255, alphaAt10)
+
+            val colorAt1 = HaramBlurFilterLogic.overlayColorArgb(style, 1)
+            val alphaAt1 = (colorAt1 ushr 24) and 0xFF
+            assertEquals(115, alphaAt1)
+        }
+
+        // Verify ViewModel synchronizes 1..10 strength and 1..20px in-app strength
+        viewModel.updateHaramBlurEffectStrength(10)
+        assertEquals(10, viewModel.state.first().haramBlurEffectStrength)
+        assertEquals(20, viewModel.state.first().inAppBlurStrengthPx)
+
+        viewModel.updateInAppBlurStrengthPx(6)
+        assertEquals(6, viewModel.state.first().inAppBlurStrengthPx)
+        assertEquals(3, viewModel.state.first().haramBlurEffectStrength)
+    }
+
+    @Test
+    fun testStrictGenderIsolationPreventsOppositeGenderSkinBlurring() {
+        // Shirtless / exposed-skin MALE subject (revealingSkinConfidence = 0.80f, explicitPornNudityConfidence = 0.10f)
+        val maleWithExposedSkin = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.2f, 0.7f, 0.8f),
+            gender = DetectedGender.MALE,
+            genderConfidence = 0.84f,
+            nsfwConfidence = 0.10f,
+            explicitPornNudityConfidence = 0.10f,
+            revealingSkinConfidence = 0.80f
+        )
+
+        // When targetGender = FEMALE, a MALE face/figure/exposed-skin MUST NOT be blurred
+        assertFalse(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.HIGH
+            )
+        )
+        // When targetGender = MALE or BOTH, the MALE subject IS blurred
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.BOTH,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+
+        // Exposed-skin FEMALE subject (revealingSkinConfidence = 0.76f, explicitPornNudityConfidence = 0.08f)
+        val femaleWithExposedSkin = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.2f, 0.7f, 0.8f),
+            gender = DetectedGender.FEMALE,
+            genderConfidence = 0.45f,
+            nsfwConfidence = 0.08f,
+            explicitPornNudityConfidence = 0.08f,
+            revealingSkinConfidence = 0.76f
+        )
+
+        // When targetGender = FEMALE, female exposed skin IS blurred even if face confidence alone was 0.45f
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = femaleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        // When targetGender = MALE, female non-pornographic skin MUST NOT be blurred
+        assertFalse(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = femaleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.HIGH
+            )
+        )
+
+        // Mandatory hardcore pornography / explicit nudity is ALWAYS blurred regardless of targetGender
+        val explicitPornMale = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.1f, 0.1f, 0.9f, 0.9f),
+            gender = DetectedGender.MALE,
+            genderConfidence = 0.80f,
+            nsfwConfidence = 0.88f,
+            explicitPornNudityConfidence = 0.88f,
+            revealingSkinConfidence = 0.90f
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = explicitPornMale,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.LOW
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = explicitPornMale,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.LOW
+            )
+        )
+    }
+
+    @Test
+    fun testPreBlurNewMediaSettingPersistenceAndWebViewScript() = runBlocking {
+        assertFalse(viewModel.state.first().preBlurNewMediaUntilScanned)
+        viewModel.setPreBlurNewMediaUntilScanned(true)
+        assertTrue(viewModel.state.first().preBlurNewMediaUntilScanned)
+
+        val reloaded = AmnGazeViewModel(context as Application).state.first()
+        assertTrue(reloaded.preBlurNewMediaUntilScanned)
+
+        val scriptWithPreBlur = WebViewModerationBridge.generateDomObserverJavascript(
+            whatToProtect = setOf(WhatToProtectItem.IMAGES, WhatToProtectItem.VIDEOS),
+            blurStyle = HaramBlurOverlayStyle.BLUR,
+            strengthPx = 20,
+            feedControlConfig = FeedControlConfig(),
+            preBlurNewMediaUntilScanned = true
+        )
+        assertTrue(scriptWithPreBlur.contains("window.__amngazePreBlurEnabled = true"))
+        assertTrue(scriptWithPreBlur.contains("PREBLUR"))
+        assertTrue(scriptWithPreBlur.contains("__amngazePrepareCleanCapture"))
+    }
+
+    @Test
+    fun testMultiRegionPhotoVideoGridDetectionAndIndependentTracking() {
+        // Construct a 2x3 grid bitmap (240x320) inside the active content area (top=0.08..0.92):
+        // 3 tiles contain warm skin-tone portraits (R=225, G=165, B=135) and 3 tiles are safe dark blue (R=15, G=35, B=90)
+        val w = 240
+        val h = 320
+        val gridBmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        val safeBlue = android.graphics.Color.rgb(15, 35, 90)
+        val warmSkin = android.graphics.Color.rgb(225, 165, 135)
+        gridBmp.eraseColor(safeBlue)
+
+        val cells = ContentModerationEngine.generateSpatialGridCells(
+            rows = 2,
+            cols = 3,
+            topMargin = 0.08f,
+            bottomMargin = 0.92f
+        )
+        assertEquals(6, cells.size)
+
+        // Fill tiles 0 (top-left), 2 (top-right), and 4 (bottom-middle) with warm skin-tone pixels
+        val skinTileIndices = listOf(0, 2, 4)
+        for (idx in skinTileIndices) {
+            val cell = cells[idx]
+            val leftPx = (cell.left * w).toInt().coerceIn(0, w - 1)
+            val rightPx = (cell.right * w).toInt().coerceIn(leftPx + 1, w)
+            val topPx = (cell.top * h).toInt().coerceIn(0, h - 1)
+            val bottomPx = (cell.bottom * h).toInt().coerceIn(topPx + 1, h)
+            for (y in topPx until bottomPx) {
+                for (x in leftPx until rightPx) {
+                    gridBmp.setPixel(x, y, warmSkin)
+                }
+            }
+        }
+
+        val engine = ContentModerationEngine(context)
+        try {
+            val candidates = engine.detectRegionalBlurCandidates(
+                frameBitmap = gridBmp,
+                gridRows = 2,
+                gridCols = 3
+            )
+            // Must detect the 3 skin tiles and NEVER flag the 3 safe dark-blue tiles
+            assertEquals("Must emit exactly 3 independent candidate boxes for the 3 skin grid tiles", 3, candidates.size)
+
+            val tracker = AntiFlickerRegionTracker()
+            val trackedRegions = tracker.updateRegions(
+                candidates = candidates,
+                exteriorDiff = 0.25f,
+                scrollOccurred = false,
+                nowMs = 1_000L,
+                targetGender = HaramBlurTargetGender.BOTH,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+            assertEquals("Tracker must maintain 3 separate blur regions simultaneously without merging across safe tiles", 3, trackedRegions.size)
+
+            // Verify safe tile 1 (top-middle: x ~ 0.50, y ~ 0.29) is NOT covered by any blur box
+            val safeTileCenter = cells[1]
+            val safeCenterX = safeTileCenter.centerX()
+            val safeCenterY = safeTileCenter.centerY()
+            assertFalse(
+                "Safe top-middle grid tile must remain unblurred",
+                trackedRegions.any { it.rectF.contains(safeCenterX, safeCenterY) }
+            )
+
+            // Also verify tracker supports up to MAX_CONCURRENT_REGIONS = 16 independent non-overlapping boxes
+            val sixteenCandidates = (0 until 16).map { i ->
+                val row = i / 4
+                val col = i % 4
+                val l = col * 0.25f + 0.02f
+                val t = row * 0.22f + 0.08f
+                CandidateBlurBox(
+                    normalizedRect = android.graphics.RectF(l, t, l + 0.20f, t + 0.18f),
+                    gender = DetectedGender.FEMALE,
+                    genderConfidence = 0.85f,
+                    nsfwConfidence = 0.10f,
+                    explicitPornNudityConfidence = 0.10f,
+                    revealingSkinConfidence = 0.80f,
+                    isGridCell = true
+                )
+            }
+            val merged16 = HaramBlurFilterLogic.mergeAndCapCandidates(sixteenCandidates)
+            assertEquals(16, merged16.size)
+        } finally {
+            engine.close()
+            gridBmp.recycle()
+        }
+    }
+
+    @Test
+    fun testPerRegionPerimeterDiffAndIndependentLockedRegions() {
+        val tracker = AntiFlickerRegionTracker()
+        val prevBmp = android.graphics.Bitmap.createBitmap(120, 120, android.graphics.Bitmap.Config.ARGB_8888)
+        val currBmp = android.graphics.Bitmap.createBitmap(120, 120, android.graphics.Bitmap.Config.ARGB_8888)
+        prevBmp.eraseColor(android.graphics.Color.rgb(30, 40, 50))
+        currBmp.eraseColor(android.graphics.Color.rgb(30, 40, 50))
+
+        // Mutate bottom-right quadrant of currBmp while top-left region (0.10..0.40, 0.10..0.40) stays unchanged
+        for (y in 70 until 115) {
+            for (x in 70 until 115) {
+                currBmp.setPixel(x, y, android.graphics.Color.rgb(240, 200, 180))
+            }
+        }
+
+        val topLeftRect = android.graphics.RectF(0.10f, 0.10f, 0.40f, 0.40f)
+        val bottomRightRect = android.graphics.RectF(0.55f, 0.55f, 0.90f, 0.90f)
+
+        val topLeftPerimeterDiff = tracker.computeRegionPerimeterDiff(prevBmp, currBmp, topLeftRect, 4)
+        val bottomRightPerimeterDiff = tracker.computeRegionPerimeterDiff(prevBmp, currBmp, bottomRightRect, 4)
+
+        assertEquals(0f, topLeftPerimeterDiff, 0.001f)
+        assertTrue(bottomRightPerimeterDiff > 0.10f)
+
+        prevBmp.recycle()
+        currBmp.recycle()
+    }
+
+    @Test
+    fun testChildSafe30sSnoozeOnlyAppliesToTextKeywordMatchNeverAdultUrlOrVisualNsfw() {
+        val lockoutManager = StrikeLockoutManager()
+        val scanner = FastPathUrlAndKeywordScanner()
+        val pkg = "com.android.chrome"
+        val now = 50_000L
+
+        // 1. Only TEXT_KEYWORD_MATCH is eligible for the 30-second snooze
+        assertTrue(StrikeLockoutManager.canSnoozeViolationFor30s(ViolationTriggerSource.TEXT_KEYWORD_MATCH))
+        assertFalse(StrikeLockoutManager.canSnoozeViolationFor30s(ViolationTriggerSource.ADULT_DOMAIN_URL))
+        assertFalse(StrikeLockoutManager.canSnoozeViolationFor30s(ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO))
+
+        // 2. Activate 30-second keyword-only snooze for Chrome
+        lockoutManager.snoozeKeywordTextOnly(pkg, now)
+        assertTrue(lockoutManager.isKeywordTextSnoozed(pkg, now + 5_000L))
+
+        // During the 30s snooze window:
+        // - TEXT_KEYWORD_MATCH is suppressed
+        assertFalse(lockoutManager.shouldBlockViolation(pkg, ViolationTriggerSource.TEXT_KEYWORD_MATCH, now + 5_000L))
+        // - ADULT_DOMAIN_URL (e.g., pornhub.com) and VISUAL_NSFW_IMAGE_OR_VIDEO MUST STILL BE BLOCKED!
+        assertTrue(lockoutManager.shouldBlockViolation(pkg, ViolationTriggerSource.ADULT_DOMAIN_URL, now + 5_000L))
+        assertTrue(lockoutManager.shouldBlockViolation(pkg, ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO, now + 5_000L))
+
+        // 3. Verify FastPathUrlAndKeywordScanner categorizes adult domains vs text keywords properly
+        val adultUrlMatch = scanner.findViolationMatch(
+            rawInput = "https://www.pornhub.com/view_video.php?viewkey=123",
+            isUrlBarNode = true,
+            isKeywordSnoozed = true // Even while keyword snoozed!
+        )
+        assertNotNull("Adult domain URL must NEVER be suppressed by 30s keyword snooze", adultUrlMatch)
+        assertEquals(ViolationTriggerSource.ADULT_DOMAIN_URL, adultUrlMatch!!.triggerSource)
+
+        val snoozedKeywordMatch = scanner.findViolationMatch(
+            rawInput = "Random article mentioning porn addiction in body text",
+            isUrlBarNode = false,
+            isKeywordSnoozed = true
+        )
+        assertNull("Standalone text keyword should be suppressed while keyword snooze is active", snoozedKeywordMatch)
+
+        val activeKeywordMatch = scanner.findViolationMatch(
+            rawInput = "Random article mentioning porn addiction in body text",
+            isUrlBarNode = false,
+            isKeywordSnoozed = false
+        )
+        assertNotNull(activeKeywordMatch)
+        assertEquals(ViolationTriggerSource.TEXT_KEYWORD_MATCH, activeKeywordMatch!!.triggerSource)
+    }
+
+    @Test
+    fun testAutomaticAdultBlockerModelRoutingNeverUsesGenderModelStandalone() {
+        assertEquals(
+            ModerationModelType.QUANTIZED_NSFW,
+            ContentModerationEngine.resolveAdultBlockerModelType(ModerationModelType.GENDER_FILTER)
+        )
+        assertEquals(
+            ModerationModelType.QUANTIZED_NSFW,
+            ContentModerationEngine.resolveAdultBlockerModelType(ModerationModelType.QUANTIZED_NSFW)
+        )
+        assertEquals(
+            ModerationModelType.DEFAULT_NSFW,
+            ContentModerationEngine.resolveAdultBlockerModelType(ModerationModelType.DEFAULT_NSFW)
+        )
+
+        val engine = ContentModerationEngine(context)
+        val bmp = android.graphics.Bitmap.createBitmap(64, 64, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            val verdict = engine.classifyBitmap(
+                bitmap = bmp,
+                sensitivity = 0.5f,
+                modelType = ModerationModelType.GENDER_FILTER
+            )
+            assertEquals(ModerationModelType.QUANTIZED_NSFW, verdict.modelType)
+        } finally {
+            engine.close()
+            bmp.recycle()
+        }
     }
 }
 

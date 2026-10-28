@@ -45,7 +45,8 @@ class HaramBlurProjectionService : Service() {
 
         private const val CAPTURE_WIDTH = 360
         private const val CAPTURE_HEIGHT = 640
-        private const val MIN_FRAME_INTERVAL_MS = 125L // ~8 FPS max to keep CPU cool
+        private const val MIN_FRAME_INTERVAL_MS = 85L // ~12 FPS responsive real-time cadence
+        private const val SCROLL_FRAME_INTERVAL_MS = 50L
 
         fun startProjection(context: Context, resultCode: Int, data: Intent) {
             val intent = Intent(context, HaramBlurProjectionService::class.java).apply {
@@ -82,7 +83,11 @@ class HaramBlurProjectionService : Service() {
 
     private val isFrameProcessing = AtomicBoolean(false)
     private var lastFrameProcessedTimeMs: Long = 0L
+    private var lastFullAiScanTimeMs: Long = 0L
     private var previousExteriorSig: FloatArray? = null
+    private var lastCleanFrameBitmap: Bitmap? = null
+    private val patchRestoreCanvas = android.graphics.Canvas()
+    private val patchRect = android.graphics.Rect()
 
     override fun onCreate() {
         super.onCreate()
@@ -197,7 +202,9 @@ class HaramBlurProjectionService : Service() {
         } ?: return
 
         val now = SystemClock.elapsedRealtime()
-        if ((now - lastFrameProcessedTimeMs) < MIN_FRAME_INTERVAL_MS ||
+        val scrollOccurred = HaramBlurRuntimeBus.consumeScrollFlag()
+        val minInterval = if (scrollOccurred) SCROLL_FRAME_INTERVAL_MS else MIN_FRAME_INTERVAL_MS
+        if ((now - lastFrameProcessedTimeMs) < minInterval ||
             !isFrameProcessing.compareAndSet(false, true)
         ) {
             image.close()
@@ -273,24 +280,73 @@ class HaramBlurProjectionService : Service() {
             ) { HaramBlurOverlayStyle.BLUR }
             val effectStrength = prefs.getInt(PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH, 10).coerceIn(1, 10)
 
-            val scrollOccurred = HaramBlurRuntimeBus.consumeScrollFlag()
-            if (scrollOccurred) {
-                regionTracker.onScrollDetected(HaramBlurRuntimeBus.lastScrollDeltaY)
+            val scrollDeltaY = HaramBlurRuntimeBus.lastScrollDeltaY
+            if (scrollOccurred && kotlin.math.abs(scrollDeltaY) > 0.005f) {
+                regionTracker.onScrollDetected(scrollDeltaY)
             }
 
-            val currentLockedRects = regionTracker.getActiveRegions().map { it.rectF }
+            val activeTrackedRegions = regionTracker.getActiveRegions()
+            val currentLockedRects = activeTrackedRegions.map { it.rectF }
             val currentExteriorSig = regionTracker.computeExteriorLumaSignature(frameBitmap, currentLockedRects)
             val exteriorDiff = regionTracker.computeExteriorLumaDiff(previousExteriorSig, currentExteriorSig)
             previousExteriorSig = currentExteriorSig
 
-            // Only run heavy neural inference if exterior scene changed (`exteriorDiff >= 0.04f`),
-            // a scroll occurred, or no regions are currently tracked
-            val candidates = if (currentLockedRects.isNotEmpty() &&
+            // Per-Region Independent Anti-Flicker & Clean Unoccluded Patch Restoration:
+            // For each active TrackedBlurRegion, inspect its 4-pixel exterior border perimeter.
+            // If its local perimeter diff < 0.04f and no scroll occurred, lock that specific region
+            // and composite-restore its unoccluded patch from lastCleanFrameBitmap into frameBitmap
+            // so the rendered blur overlay never blinds the detector.
+            val lockedRegionIds = HashSet<Int>()
+            val cleanRef = lastCleanFrameBitmap
+            if (cleanRef != null && !cleanRef.isRecycled && activeTrackedRegions.isNotEmpty() && !scrollOccurred) {
+                patchRestoreCanvas.setBitmap(frameBitmap)
+                val bw = frameBitmap.width
+                val bh = frameBitmap.height
+                for (region in activeTrackedRegions) {
+                    val localPerimeterDiff = regionTracker.computeRegionPerimeterDiff(
+                        prevBitmap = cleanRef,
+                        currBitmap = frameBitmap,
+                        normRect = region.rectF,
+                        borderPx = 4
+                    )
+                    if (localPerimeterDiff < HaramBlurFilterLogic.EXTERIOR_STATIONARY_DIFF_THRESHOLD ||
+                        exteriorDiff < HaramBlurFilterLogic.EXTERIOR_STATIONARY_DIFF_THRESHOLD
+                    ) {
+                        lockedRegionIds.add(region.id)
+                    }
+                    if (localPerimeterDiff < 0.14f || exteriorDiff < 0.14f) {
+                        patchRect.set(
+                            (region.rectF.left * bw).toInt().coerceIn(0, bw - 1),
+                            (region.rectF.top * bh).toInt().coerceIn(0, bh - 1),
+                            (region.rectF.right * bw).toInt().coerceIn(1, bw),
+                            (region.rectF.bottom * bh).toInt().coerceIn(1, bh)
+                        )
+                        if (patchRect.width() > 4 && patchRect.height() > 4) {
+                            patchRestoreCanvas.drawBitmap(cleanRef, patchRect, patchRect, null)
+                        }
+                    }
+                }
+            }
+
+            // Cache current clean/restored frame for next cycle's unoccluded patch restoration
+            if (lastCleanFrameBitmap == null || lastCleanFrameBitmap?.isRecycled == true) {
+                lastCleanFrameBitmap = frameBitmap.copy(Bitmap.Config.ARGB_8888, true)
+            } else {
+                patchRestoreCanvas.setBitmap(lastCleanFrameBitmap!!)
+                patchRestoreCanvas.drawBitmap(frameBitmap, 0f, 0f, null)
+            }
+
+            // Continue scanning for newly playing video frames or grid cells unless the entire
+            // exterior screen is 100% static (< 0.008f) AND we ran a full AI scan within the last 400ms
+            val shouldSkipInference = currentLockedRects.isNotEmpty() &&
                 !scrollOccurred &&
-                exteriorDiff < HaramBlurFilterLogic.EXTERIOR_STATIONARY_DIFF_THRESHOLD
-            ) {
+                exteriorDiff < 0.008f &&
+                (now - lastFullAiScanTimeMs) < 400L
+
+            val candidates = if (shouldSkipInference) {
                 emptyList()
             } else {
+                lastFullAiScanTimeMs = now
                 moderationEngine.detectRegionalBlurCandidates(frameBitmap)
             }
 
@@ -300,7 +356,8 @@ class HaramBlurProjectionService : Service() {
                 scrollOccurred = scrollOccurred,
                 nowMs = now,
                 targetGender = targetGender,
-                sensitivity = sensitivity
+                sensitivity = sensitivity,
+                lockedRegionIds = lockedRegionIds
             )
 
             mainHandler.post {
@@ -341,6 +398,12 @@ class HaramBlurProjectionService : Service() {
         } catch (_: Throwable) {
         }
         mediaProjection = null
+
+        try {
+            lastCleanFrameBitmap?.recycle()
+        } catch (_: Throwable) {
+        }
+        lastCleanFrameBitmap = null
 
         regionTracker.clearAll()
         previousExteriorSig = null

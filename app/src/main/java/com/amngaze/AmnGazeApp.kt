@@ -1607,102 +1607,7 @@ fun MainDashboardScreen(
                 }
             }
 
-            // 7. On-Device LiteRT Moderation Model Selector
-            item {
-                Text(
-                    "ON-DEVICE LITERT MODEL",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    letterSpacing = 0.08.sp
-                )
-            }
-
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                    )
-                ) {
-                    Column {
-                        ModerationModelType.entries.forEachIndexed { index, modelType ->
-                            val (title, description, icon) = when (modelType) {
-                                ModerationModelType.DEFAULT_NSFW -> Triple(
-                                    "Default NSFW Filter",
-                                    "Standard MobileNet V2 NSFW model (amn_gaze.tflite)",
-                                    Icons.Default.Security
-                                )
-                                ModerationModelType.QUANTIZED_NSFW -> Triple(
-                                    "Quantized NSFW Filter",
-                                    "Fast INT8/UINT8 quantized model (nsfw_mobilenet_v2_140_224_quantized.tflite)",
-                                    Icons.Default.Speed
-                                )
-                                ModerationModelType.GENDER_FILTER -> Triple(
-                                    "Gender / Revealing Filter",
-                                    "Compact gender classification model (model_lite_gender_q.tflite)",
-                                    Icons.Default.Face
-                                )
-                            }
-
-                            val isSelected = state.amnGazeModelType == modelType
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { viewModel.updateModelType(modelType) }
-                                    .background(
-                                        if (isSelected)
-                                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
-                                        else Color.Transparent
-                                    )
-                                    .padding(horizontal = 16.dp, vertical = 14.dp)
-                                    .testTag("model_type_${modelType.name}"),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                RadioButton(
-                                    selected = isSelected,
-                                    onClick = { viewModel.updateModelType(modelType) },
-                                    colors = RadioButtonDefaults.colors(
-                                        selectedColor = MaterialTheme.colorScheme.primary
-                                    )
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Icon(
-                                    imageVector = icon,
-                                    contentDescription = null,
-                                    tint = if (isSelected) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        title,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isSelected) MaterialTheme.colorScheme.primary
-                                        else MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Text(
-                                        description,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                            if (index < ModerationModelType.entries.size - 1) {
-                                HorizontalDivider(
-                                    modifier = Modifier.padding(horizontal = 16.dp),
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 8. Strike & Lockout Status Card
+            // 7. Strike & Lockout Status Card
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1753,7 +1658,7 @@ fun MainDashboardScreen(
                 )
             }
 
-            // 9. Privacy & Architecture Summary Footer
+            // 8. Privacy & Architecture Summary Footer
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1773,15 +1678,10 @@ fun MainDashboardScreen(
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(Modifier.width(10.dp))
-                        val modelLabel = when (state.amnGazeModelType) {
-                            ModerationModelType.DEFAULT_NSFW -> "Default NSFW (amn_gaze.tflite)"
-                            ModerationModelType.QUANTIZED_NSFW -> "Quantized NSFW (nsfw_mobilenet_v2_140_224_quantized.tflite)"
-                            ModerationModelType.GENDER_FILTER -> "Gender Filter (model_lite_gender_q.tflite)"
-                        }
                         Text(
                             "AmnGaze runs 100% locally in RAM with zero cloud uploads. " +
                                 "Scroll-settled screenshots (180ms settle / 750ms ceiling), MediaProjection regional frames, and HardwareBuffers are recycled immediately after inference. " +
-                                "Active Model: $modelLabel.",
+                                "Engine automatically orchestrates Quantized NSFW (224x224), Default NSFW Verification (224x224), and Gender/Face Classification (128x128).",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

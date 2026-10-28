@@ -287,7 +287,18 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         val rawEventPkg = event?.packageName?.toString() ?: return
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            HaramBlurRuntimeBus.onScrollDetected(0f)
+            val screenH = resources.displayMetrics.heightPixels.coerceAtLeast(640).toFloat()
+            val rawDeltaY = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                event.scrollDeltaY
+            } else {
+                0
+            }
+            val normDeltaY = if (rawDeltaY != 0) {
+                (-rawDeltaY.toFloat() / screenH).coerceIn(-0.40f, 0.40f)
+            } else {
+                0f
+            }
+            HaramBlurRuntimeBus.onScrollDetected(normDeltaY)
         }
 
         // Ignore Accessibility events emitted by our own overlay window so we never self-trigger
@@ -380,14 +391,11 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             prefs.getInt(PREFS_KEY_ENFORCEMENT_MODE, EnforcementMode.CURTAIN_SHIELD.ordinal)
         ) { EnforcementMode.CURTAIN_SHIELD }
 
-        // 3. Check if user temporarily whitelisted this package for 30s ("False Positive - Unblur for 30s")
-        if (strikeLockoutManager.isPackageWhitelisted(pkg, now)) {
-            stopAllVisualScanTimers()
-            if (overlayManager.isShieldVisible && overlayManager.shieldedPackage == pkg) {
-                overlayManager.hide()
-            }
-            return
-        }
+        // 3. Evaluate whether ambiguous text keywords are currently snoozed for 30s.
+        //    CRITICAL CHILD-SAFETY INVARIANT: A 30-second keyword snooze NEVER pauses or disables
+        //    explicit adult domain blocking (ADULT_DOMAIN_URL) or visual AI screenshot scanning
+        //    (VISUAL_NSFW_IMAGE_OR_VIDEO).
+        val isKeywordSnoozed = strikeLockoutManager.isKeywordTextSnoozed(pkg, now)
 
         // 4. Only enforce 15-minute 3-strike cooldown lockouts when the user explicitly selected
         //    Bulldog HARD_EJECT mode. In CURTAIN_SHIELD mode, never lock out or force-eject the app.
@@ -420,16 +428,25 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             if (rootNode != null) {
                 val rootPkg = rootNode.packageName?.toString() ?: pkg
                 if (rootPkg == pkg && isEligibleForVisualScan(rootPkg)) {
-                    val violationReason = scanUiTreeFastPathSafely(
+                    val violationMatch = scanUiTreeFastPathSafely(
                         root = rootNode,
-                        isBrowserApp = pkg in FastPathUrlAndKeywordScanner.BROWSER_PACKAGES
+                        isBrowserApp = pkg in FastPathUrlAndKeywordScanner.BROWSER_PACKAGES,
+                        isKeywordSnoozed = isKeywordSnoozed
                     )
-                    if (violationReason != null) {
+                    if (violationMatch != null &&
+                        strikeLockoutManager.shouldBlockViolation(pkg, violationMatch.triggerSource, now)
+                    ) {
+                        val category = when (violationMatch.triggerSource) {
+                            ViolationTriggerSource.ADULT_DOMAIN_URL -> "ADULT_DOMAIN_URL"
+                            ViolationTriggerSource.TEXT_KEYWORD_MATCH -> "TEXT_KEYWORD_MATCH"
+                            ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO -> "VISUAL_NSFW_IMAGE_OR_VIDEO"
+                        }
                         enforceViolation(
                             packageName = pkg,
-                            categoryName = "FAST_PATH_URL_OR_TEXT",
-                            reasonDescription = violationReason,
-                            confidence = 1.0f
+                            categoryName = category,
+                            reasonDescription = violationMatch.reason,
+                            confidence = 1.0f,
+                            triggerSource = violationMatch.triggerSource
                         )
                         return
                     }
@@ -472,12 +489,13 @@ class AmnGazeAccessibilityService : AccessibilityService() {
      */
     private fun scanUiTreeFastPathSafely(
         root: AccessibilityNodeInfo,
-        isBrowserApp: Boolean
-    ): String? {
+        isBrowserApp: Boolean,
+        isKeywordSnoozed: Boolean = false
+    ): ViolationMatch? {
         val allocatedNodes = ArrayList<AccessibilityNodeInfo>(MAX_BFS_NODES + 16)
         allocatedNodes.add(root)
         try {
-            // 1. Targeted O(1) lookup for known browser URL bars
+            // 1. Targeted O(1) lookup for known browser URL bars (ADULT_DOMAIN_URL is never snoozed)
             for (urlBarId in FastPathUrlAndKeywordScanner.KNOWN_BROWSER_URL_BAR_IDS) {
                 val urlNodes = try {
                     root.findAccessibilityNodeInfosByViewId(urlBarId)
@@ -488,9 +506,10 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                     allocatedNodes.addAll(urlNodes)
                     for (node in urlNodes) {
                         val urlText = node.text?.toString()
-                        val violation = urlAndKeywordScanner.findViolationReason(
+                        val violation = urlAndKeywordScanner.findViolationMatch(
                             rawInput = urlText,
-                            isUrlBarNode = true
+                            isUrlBarNode = true,
+                            isKeywordSnoozed = isKeywordSnoozed
                         )
                         if (violation != null) return violation
                     }
@@ -509,17 +528,19 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                 val current = queue.poll() ?: continue
                 inspectedCount++
 
-                val textReason = urlAndKeywordScanner.findViolationReason(
+                val textMatch = urlAndKeywordScanner.findViolationMatch(
                     rawInput = current.text?.toString(),
-                    isUrlBarNode = false
+                    isUrlBarNode = false,
+                    isKeywordSnoozed = isKeywordSnoozed
                 )
-                if (textReason != null) return textReason
+                if (textMatch != null) return textMatch
 
-                val descReason = urlAndKeywordScanner.findViolationReason(
+                val descMatch = urlAndKeywordScanner.findViolationMatch(
                     rawInput = current.contentDescription?.toString(),
-                    isUrlBarNode = false
+                    isUrlBarNode = false,
+                    isKeywordSnoozed = isKeywordSnoozed
                 )
-                if (descReason != null) return descReason
+                if (descMatch != null) return descMatch
 
                 val childCount = current.childCount
                 for (i in 0 until childCount) {
@@ -553,6 +574,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
      * SAFEGUARDS 1, 2, 3 & 4: Rate-limit-aware, atomic-guarded `takeScreenshot()` pipeline.
      * Verifies both before and after capture that the user is still inside [targetPackage]
      * so an in-flight screenshot never triggers an overlay after the user returns to their launcher.
+     *
+     * Note: Visual NSFW screenshot scanning is NEVER disabled by a 30-second keyword snooze.
      */
     @RequiresApi(Build.VERSION_CODES.R)
     private fun executeScreenshotScan(targetPackage: String) {
@@ -560,7 +583,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         if (!isEligibleForVisualScan(targetPackage) || activeForegroundPackage != targetPackage) {
             return
         }
-        if (overlayManager.isShieldVisible || strikeLockoutManager.isPackageWhitelisted(targetPackage, now)) {
+        if (overlayManager.isShieldVisible) {
             return
         }
         if (!scrollDebounceController.canExecuteScreenshot(now, Build.VERSION.SDK_INT)) {
@@ -573,9 +596,6 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         scrollDebounceController.onScanDispatched(now)
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val sensitivity = prefs.getFloat(PREFS_KEY_BLUR_SENSITIVITY, 0.5f)
-        val modelType = ModerationModelType.entries.getOrElse(
-            prefs.getInt(PREFS_KEY_MODEL_TYPE, ModerationModelType.DEFAULT_NSFW.ordinal)
-        ) { ModerationModelType.DEFAULT_NSFW }
         val blockIncognitoEnabled = prefs.getBoolean(PREFS_KEY_BLOCK_INCOGNITO, false)
         val includeSexyScore = prefs.getBoolean(PREFS_KEY_INCLUDE_SEXY_SCORE, true)
 
@@ -590,7 +610,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                                 hardwareBuffer = screenshot.hardwareBuffer,
                                 colorSpace = screenshot.colorSpace,
                                 sensitivity = sensitivity,
-                                modelType = modelType,
+                                modelType = ModerationModelType.QUANTIZED_NSFW,
                                 includeSexyScore = includeSexyScore
                             )
                             if (verdict.isViolation) {
@@ -602,7 +622,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                                             packageName = targetPackage,
                                             categoryName = verdict.categoryName,
                                             reasonDescription = "On-device LiteRT model flagged explicit content ($pct% confidence).",
-                                            confidence = verdict.confidence
+                                            confidence = verdict.confidence,
+                                            triggerSource = ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO
                                         )
                                     }
                                 }
@@ -624,7 +645,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                                         packageName = targetPackage,
                                         categoryName = "INCOGNITO_OR_SECURE_WINDOW",
                                         reasonDescription = "Browser Incognito / Private tab blocked by AmnGaze protection policy.",
-                                        confidence = 1.0f
+                                        confidence = 1.0f,
+                                        triggerSource = ViolationTriggerSource.ADULT_DOMAIN_URL
                                     )
                                 }
                             }
@@ -641,9 +663,11 @@ class AmnGazeAccessibilityService : AccessibilityService() {
     /**
      * LAYER 3: App-Scoped Shield & Mode-Specific Enforcement.
      *
-     * - In [EnforcementMode.CURTAIN_SHIELD]: Shows the Curtain Shield over [packageName] only,
-     *   with "False Positive - Unblur for 30s" and "Leave Page Safely". Never locks the app for
-     *   15 minutes and automatically hides the shield when leaving [packageName].
+     * - In [EnforcementMode.CURTAIN_SHIELD]: Shows the Curtain Shield over [packageName] only.
+     *   Only shows "Skip Keyword Alert for 30s" when [triggerSource] is [ViolationTriggerSource.TEXT_KEYWORD_MATCH]
+     *   (and Parental PIN is not enabled). Explicit adult domains ([ViolationTriggerSource.ADULT_DOMAIN_URL])
+     *   and visual AI detections ([ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO]) NEVER show a 30s
+     *   bypass button and can only be dismissed via "Leave Page Safely".
      * - In [EnforcementMode.HARD_EJECT]: Records strikes (3 strikes in 5m -> 15m lockout for that
      *   specific app), fires `GLOBAL_ACTION_BACK` or `GLOBAL_ACTION_HOME`, and hides the shield
      *   as soon as the app exits.
@@ -652,7 +676,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         packageName: String,
         categoryName: String,
         reasonDescription: String,
-        confidence: Float
+        confidence: Float,
+        triggerSource: ViolationTriggerSource = ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO
     ) {
         if (!isEligibleForVisualScan(packageName) || activeForegroundPackage != packageName) {
             return
@@ -676,9 +701,10 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         val showBadge = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BADGE, true)
         val showBorder = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BORDER, true)
         val parentalPinEnabled = prefs.getBoolean(PREFS_KEY_PARENTAL_PIN_ENABLED, false)
+        val allowKeywordSnooze = !parentalPinEnabled &&
+            StrikeLockoutManager.canSnoozeViolationFor30s(triggerSource)
 
         if (enforcementMode == EnforcementMode.CURTAIN_SHIELD) {
-            // Curtain Shield Mode: App-scoped overlay with 30-second unblur window; NO 3-strike 15m lockout
             overlayManager.showCurtainShield(
                 targetPackage = packageName,
                 censorStyle = censorStyle,
@@ -687,15 +713,15 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                 title = "Explicit or Triggering Content Blocked",
                 reason = reasonDescription,
                 strikeStatus = "App: $packageName | Category: $categoryName",
-                allowFalsePositiveUnblur = !parentalPinEnabled,
+                allowFalsePositiveUnblur = allowKeywordSnooze,
                 primaryActionLabel = "Leave Page Safely",
-                secondaryActionLabel = "Unblur App for 30s"
+                secondaryActionLabel = "Skip Keyword Alert for 30s"
             )
             return
         }
 
         // Bulldog HARD_EJECT mode: Record strike and escalate to 15-minute lockout on 3rd strike
-        val strikeDecision = strikeLockoutManager.recordViolation(packageName, now)
+        val strikeDecision = strikeLockoutManager.recordViolation(packageName, now, triggerSource)
         if (strikeDecision.isLockedOut) {
             showLockoutCurtainAndRedirectHome(packageName, strikeDecision.remainingLockMs, prefs)
             return
@@ -711,9 +737,9 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             title = "Explicit or Triggering Content Blocked",
             reason = reasonDescription,
             strikeStatus = strikeText,
-            allowFalsePositiveUnblur = !parentalPinEnabled,
+            allowFalsePositiveUnblur = allowKeywordSnooze,
             primaryActionLabel = "Leave Page Safely",
-            secondaryActionLabel = "Unblur App for 30s"
+            secondaryActionLabel = "Skip Keyword Alert for 30s"
         )
 
         performGlobalAction(GLOBAL_ACTION_BACK)
@@ -739,7 +765,6 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         ) { BlurCensorStyle.FROSTED }
         val showBadge = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BADGE, true)
         val showBorder = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BORDER, true)
-        val parentalPinEnabled = prefs.getBoolean(PREFS_KEY_PARENTAL_PIN_ENABLED, false)
 
         val totalSeconds = (remainingMs / 1000L).coerceAtLeast(1L)
         val minutes = totalSeconds / 60L
@@ -754,9 +779,9 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             title = "App Locked for 15-Minute Cooldown",
             reason = "3 content violations were recorded in $packageName within 5 minutes.",
             strikeStatus = "COOLDOWN ACTIVE - REMAINING: $formattedRemaining",
-            allowFalsePositiveUnblur = !parentalPinEnabled,
+            allowFalsePositiveUnblur = false,
             primaryActionLabel = "Return to Safe Home",
-            secondaryActionLabel = "Unblur App for 30s"
+            secondaryActionLabel = "Skip Keyword Alert for 30s"
         )
 
         performGlobalAction(GLOBAL_ACTION_HOME)
@@ -789,10 +814,15 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         val now = SystemClock.elapsedRealtime()
         val pkg = overlayManager.shieldedPackage ?: activeForegroundPackage
         if (pkg.isNotEmpty()) {
-            strikeLockoutManager.whitelistPackageTemporarily(pkg, now)
+            // Snooze ONLY ambiguous text keyword matches for 30s; explicit domains & visual AI remain 100% active
+            strikeLockoutManager.snoozeKeywordTextOnly(pkg, now)
         }
-        stopAllVisualScanTimers()
         overlayManager.hide()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && pkg.isNotEmpty()) {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ensureVideoHeartbeatState(pkg, prefs)
+            schedulePostScrollVisualScans(scrollDebounceController.settleDelayMs)
+        }
     }
 
     private fun isIgnoredSystemOrSelfPackage(pkg: String): Boolean {

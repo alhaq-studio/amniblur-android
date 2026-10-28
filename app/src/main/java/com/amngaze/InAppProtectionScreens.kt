@@ -222,7 +222,7 @@ private fun ProtectionModeOptionCard(
                     modifier = Modifier.padding(vertical = 2.dp)
                 ) {
                     Text(
-                        text = "• ",
+                        text = "- ",
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -482,7 +482,7 @@ fun SettingsScreen(
                     SettingsRowCard(
                         icon = Icons.Default.Info,
                         title = "About",
-                        value = "v2.0 • 100% On-Device AI Privacy",
+                        value = "v2.0 | 100% On-Device AI Privacy",
                         onClick = { showAboutDialog = true },
                         testTag = "settings_row_about"
                     )
@@ -517,8 +517,10 @@ fun SettingsScreen(
         BlurStyleSheetDialog(
             currentStyle = state.haramBlurOverlayStyle,
             currentStrengthPx = state.inAppBlurStrengthPx,
+            preBlurNewMedia = state.preBlurNewMediaUntilScanned,
             onUpdateStyle = { viewModel.updateHaramBlurOverlayStyle(it) },
             onUpdateStrengthPx = { viewModel.updateInAppBlurStrengthPx(it) },
+            onTogglePreBlurNewMedia = { viewModel.setPreBlurNewMediaUntilScanned(it) },
             onDismiss = { showBlurStyleDialog = false }
         )
     }
@@ -955,6 +957,7 @@ fun InAppBrowserScreen(
     val coroutineScope = rememberCoroutineScope()
     val moderationEngine = remember { ContentModerationEngine(context.applicationContext) }
     val urlScanner = remember { FastPathUrlAndKeywordScanner() }
+    val strikeLockoutManager = remember { StrikeLockoutManager() }
 
     val enabledPlatforms = remember(state.connectedPlatforms) {
         state.connectedPlatforms.filter { it.enabled }.ifEmpty { ConnectedPlatform.defaultPlatforms() }
@@ -966,7 +969,8 @@ fun InAppBrowserScreen(
     var currentUrl by remember(activePlatform.id, initialUrlOverride) {
         mutableStateOf(initialUrlOverride ?: activePlatform.url)
     }
-    var blockedNavigationReason by remember { mutableStateOf<String?>(null) }
+    var blockedNavigationMatch by remember { mutableStateOf<ViolationMatch?>(null) }
+    var blockedTargetUri by remember { mutableStateOf<String?>(null) }
     var showPlatformsSheet by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
@@ -1003,8 +1007,9 @@ fun InAppBrowserScreen(
 
     BackHandler {
         val wv = webViewRef
-        if (blockedNavigationReason != null) {
-            blockedNavigationReason = null
+        if (blockedNavigationMatch != null) {
+            blockedNavigationMatch = null
+            blockedTargetUri = null
         } else if (wv != null && wv.canGoBack()) {
             wv.goBack()
         } else if (onReturnToSystemDashboard != null) {
@@ -1021,6 +1026,7 @@ fun InAppBrowserScreen(
             .windowInsetsPadding(WindowInsets.systemBars)
             .testTag("in_app_browser_screen")
     ) {
+        val activeViolation = blockedNavigationMatch
         if (isDailyLimitReached) {
             Column(
                 modifier = Modifier
@@ -1054,7 +1060,10 @@ fun InAppBrowserScreen(
                     Text("Switch Platform or Open Settings")
                 }
             }
-        } else if (blockedNavigationReason != null) {
+        } else if (activeViolation != null) {
+            val canSnoozeKeyword = !state.parentalPinEnabled &&
+                StrikeLockoutManager.canSnoozeViolationFor30s(activeViolation.triggerSource)
+
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1071,14 +1080,18 @@ fun InAppBrowserScreen(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Explicit Domain Blocked by AmnGaze",
+                    text = if (activeViolation.triggerSource == ViolationTriggerSource.ADULT_DOMAIN_URL) {
+                        "Explicit Domain Blocked by AmnGaze"
+                    } else {
+                        "Explicit Keyword Blocked by AmnGaze"
+                    },
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = blockedNavigationReason ?: "Explicit URL blocked.",
+                    text = activeViolation.reason,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
@@ -1086,11 +1099,31 @@ fun InAppBrowserScreen(
                 Spacer(modifier = Modifier.height(20.dp))
                 Button(
                     onClick = {
-                        blockedNavigationReason = null
+                        blockedNavigationMatch = null
+                        blockedTargetUri = null
                         webViewRef?.loadUrl(activePlatform.url)
                     }
                 ) {
                     Text("Return to ${activePlatform.name}")
+                }
+                if (canSnoozeKeyword) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            val now = System.currentTimeMillis()
+                            strikeLockoutManager.snoozeKeywordTextOnly(activePlatform.id, now)
+                            val resumeUri = blockedTargetUri
+                            blockedNavigationMatch = null
+                            blockedTargetUri = null
+                            if (!resumeUri.isNullOrBlank()) {
+                                currentUrl = resumeUri
+                                webViewRef?.loadUrl(resumeUri)
+                            }
+                        },
+                        modifier = Modifier.testTag("in_app_skip_keyword_30s_button")
+                    ) {
+                        Text("Skip Keyword Alert for 30s")
+                    }
                 }
             }
         } else {
@@ -1118,12 +1151,25 @@ fun InAppBrowserScreen(
                             ): Boolean {
                                 val targetUri = request?.url?.toString() ?: return false
                                 if (WhatToProtectItem.EXPLICIT_TEXT_URLS in viewModel.state.value.whatToProtect) {
-                                    val violation = urlScanner.findViolationReason(
-                                        rawInput = targetUri,
-                                        isUrlBarNode = true
+                                    val now = System.currentTimeMillis()
+                                    val isKeywordSnoozed = strikeLockoutManager.isKeywordTextSnoozed(
+                                        activePlatform.id,
+                                        now
                                     )
-                                    if (violation != null) {
-                                        blockedNavigationReason = violation
+                                    val violationMatch = urlScanner.findViolationMatch(
+                                        rawInput = targetUri,
+                                        isUrlBarNode = true,
+                                        isKeywordSnoozed = isKeywordSnoozed
+                                    )
+                                    if (violationMatch != null &&
+                                        strikeLockoutManager.shouldBlockViolation(
+                                            activePlatform.id,
+                                            violationMatch.triggerSource,
+                                            now
+                                        )
+                                    ) {
+                                        blockedTargetUri = targetUri
+                                        blockedNavigationMatch = violationMatch
                                         return true
                                     }
                                 }
@@ -1207,7 +1253,8 @@ fun InAppBrowserScreen(
             currentUrl = currentUrl,
             onSelectPlatform = { selected ->
                 viewModel.setActivePlatform(selected.id)
-                blockedNavigationReason = null
+                blockedNavigationMatch = null
+                blockedTargetUri = null
                 currentUrl = selected.url
                 webViewRef?.loadUrl(selected.url)
                 showPlatformsSheet = false
@@ -1231,7 +1278,8 @@ private fun injectDomProtectionScript(webView: WebView?, state: AmnGazeState) {
         whatToProtect = state.whatToProtect,
         blurStyle = state.haramBlurOverlayStyle,
         strengthPx = state.inAppBlurStrengthPx,
-        feedControlConfig = state.feedControlConfig
+        feedControlConfig = state.feedControlConfig,
+        preBlurNewMediaUntilScanned = state.preBlurNewMediaUntilScanned
     )
     wv.evaluateJavascript(script, null)
 }
@@ -1481,10 +1529,16 @@ fun DetectionSensitivitySelectorDialog(
 fun BlurStyleSheetDialog(
     currentStyle: HaramBlurOverlayStyle,
     currentStrengthPx: Int,
+    preBlurNewMedia: Boolean = false,
     onUpdateStyle: (HaramBlurOverlayStyle) -> Unit,
     onUpdateStrengthPx: (Int) -> Unit,
+    onTogglePreBlurNewMedia: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
+    val strength10 = ((currentStrengthPx + 1) / 2).coerceIn(1, 10)
+    val solidnessPct = HaramBlurFilterLogic.computeOverlaySolidnessPercent(strength10)
+    val solidnessDesc = if (solidnessPct >= 100) "100% Solid (No See-Through)" else "${solidnessPct}% Solidness"
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Blur Style & Effect Strength", fontWeight = FontWeight.Bold) },
@@ -1505,7 +1559,7 @@ fun BlurStyleSheetDialog(
                     }
                 }
                 Text(
-                    "Effect Strength: ${currentStrengthPx}px",
+                    "Effect Strength: ${strength10}/10 (${currentStrengthPx}px | $solidnessDesc)",
                     fontWeight = FontWeight.SemiBold
                 )
                 Slider(
@@ -1514,6 +1568,28 @@ fun BlurStyleSheetDialog(
                     valueRange = 1f..20f,
                     steps = 18
                 )
+                HorizontalDivider()
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onTogglePreBlurNewMedia(!preBlurNewMedia) }
+                        .testTag("dialog_preblur_new_media_toggle"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Pre-Blur New Media Until Scanned", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Blur newly appearing images and videos until AI verification finishes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = preBlurNewMedia,
+                        onCheckedChange = { onTogglePreBlurNewMedia(it) }
+                    )
+                }
             }
         },
         confirmButton = {

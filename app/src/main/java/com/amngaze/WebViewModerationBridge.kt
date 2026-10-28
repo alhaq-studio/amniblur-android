@@ -125,6 +125,7 @@ class WebViewModerationBridge(
     companion object {
         private const val TAG = "WebViewModBridge"
         const val VIEWPORT_CAPTURE_WIDTH = 480
+        const val MAX_BATCH_TILES = 16
 
         /**
          * Maps a CSS viewport bounding box ([ViewportMediaItem]) to clamped pixel coordinates
@@ -253,7 +254,8 @@ class WebViewModerationBridge(
             whatToProtect: Set<WhatToProtectItem>,
             blurStyle: HaramBlurOverlayStyle,
             strengthPx: Int,
-            feedControlConfig: FeedControlConfig
+            feedControlConfig: FeedControlConfig,
+            preBlurNewMediaUntilScanned: Boolean = false
         ): String {
             val protectImages = WhatToProtectItem.IMAGES in whatToProtect
             val protectVideos = WhatToProtectItem.VIDEOS in whatToProtect
@@ -264,9 +266,15 @@ class WebViewModerationBridge(
 
             return """
                 (function() {
+                    window.__amngazePreBlurEnabled = $preBlurNewMediaUntilScanned;
+                    window.__amngazeDefaultStyle = '${blurStyle.name}';
+                    window.__amngazeDefaultStrengthPx = $strengthPx;
                     if (window.__amngazeInitialized) {
                         if (window.__amngazeUpdateFeedCss) {
                             window.__amngazeUpdateFeedCss('$feedCss');
+                        }
+                        if (window.__amngazeRefreshActiveOverlays) {
+                            window.__amngazeRefreshActiveOverlays('${blurStyle.name}', $strengthPx);
                         }
                         return;
                     }
@@ -277,38 +285,82 @@ class WebViewModerationBridge(
 
                     var styleEl = document.createElement('style');
                     styleEl.id = '__amngaze_feed_style';
-                    styleEl.innerHTML = '$feedCss';
+                    styleEl.innerHTML = '$feedCss html.__amngaze-clean-capture [data-amngaze-verdict="PREBLUR"] { filter: none !important; transition: none !important; }';
                     (document.head || document.documentElement).appendChild(styleEl);
 
                     window.__amngazeUpdateFeedCss = function(cssText) {
                         var el = document.getElementById('__amngaze_feed_style');
-                        if (el) el.innerHTML = cssText;
+                        if (el) el.innerHTML = cssText + ' html.__amngaze-clean-capture [data-amngaze-verdict="PREBLUR"] { filter: none !important; transition: none !important; }';
+                    };
+
+                    window.__amngazePrepareCleanCapture = function() {
+                        document.documentElement.classList.add('__amngaze-clean-capture');
+                    };
+
+                    window.__amngazeRestoreAfterCapture = function() {
+                        document.documentElement.classList.remove('__amngaze-clean-capture');
                     };
 
                     function applyOverlayStyle(el, styleName, px) {
-                        var blurPx = Math.max(8, px * 2);
+                        var clampedPx = Math.max(1, Math.min(20, px || 10));
+                        var strength10 = Math.max(1, Math.min(10, Math.round(clampedPx / 2)));
+                        var isSolidOpaque = (strength10 >= 9);
+                        var blurPx = Math.max(6, Math.round(clampedPx * 2.2));
+                        var dimBrightness = isSolidOpaque ? 0.0 : Math.max(0.08, 1.0 - (strength10 * 0.085));
+                        var contrastFactor = isSolidOpaque ? 0.0 : Math.max(0.15, 1.0 - (strength10 * 0.075));
+
                         if (styleName === 'BLACK') {
-                            el.style.filter = 'brightness(0)';
+                            if (isSolidOpaque) {
+                                el.style.filter = 'brightness(0) contrast(0)';
+                            } else {
+                                el.style.filter = 'blur(' + blurPx + 'px) brightness(' + (dimBrightness * 0.4) + ')';
+                            }
                             el.style.backgroundColor = '#000000';
                         } else if (styleName === 'GRAY') {
-                            el.style.filter = 'brightness(0) invert(0.56)';
+                            if (isSolidOpaque) {
+                                el.style.filter = 'brightness(0) invert(0.56)';
+                            } else {
+                                el.style.filter = 'blur(' + blurPx + 'px) grayscale(1) contrast(' + contrastFactor + ') brightness(' + (0.45 + dimBrightness * 0.3) + ')';
+                            }
                             el.style.backgroundColor = '#8E8E93';
                         } else if (styleName === 'SKIN') {
-                            el.style.filter = 'blur(' + blurPx + 'px) sepia(0.45)';
+                            if (isSolidOpaque) {
+                                el.style.filter = 'brightness(0) invert(0.82) sepia(0.35)';
+                            } else {
+                                el.style.filter = 'blur(' + blurPx + 'px) sepia(0.55) contrast(' + contrastFactor + ')';
+                            }
                             el.style.backgroundColor = '#E8BEAC';
                         } else if (styleName === 'PIXELATE') {
-                            el.style.filter = 'blur(' + blurPx + 'px) contrast(1.35)';
+                            if (isSolidOpaque) {
+                                el.style.filter = 'brightness(0) invert(0.12)';
+                            } else {
+                                el.style.filter = 'blur(' + blurPx + 'px) contrast(' + (1.2 + (10 - strength10) * 0.05) + ') brightness(' + dimBrightness + ')';
+                            }
+                            el.style.backgroundColor = '#0F172A';
                         } else {
-                            el.style.filter = 'blur(' + blurPx + 'px)';
+                            // BLUR style: scales from translucent blur at 1/10 up to 100% solid opaque at 9..10/10
+                            if (isSolidOpaque) {
+                                el.style.filter = 'brightness(0) invert(0.14)';
+                            } else {
+                                el.style.filter = 'blur(' + blurPx + 'px) contrast(' + contrastFactor + ') brightness(' + dimBrightness + ')';
+                            }
+                            el.style.backgroundColor = '#182232';
                         }
-                        el.style.transition = 'filter 0.12s ease-out';
+                        el.style.transition = 'filter 0.10s ease-out';
                     }
+
+                    window.__amngazeRefreshActiveOverlays = function(styleName, px) {
+                        var blurredNodes = document.querySelectorAll('[data-amngaze-verdict="BLURRED"]');
+                        for (var i = 0; i < blurredNodes.length; i++) {
+                            applyOverlayStyle(blurredNodes[i], styleName, px);
+                        }
+                    };
 
                     window.__amngazeApplyVerdicts = function(payload) {
                         try {
                             var data = (typeof payload === 'string') ? JSON.parse(payload) : payload;
-                            var styleName = data.style || '${blurStyle.name}';
-                            var px = data.strengthPx || $strengthPx;
+                            var styleName = data.style || window.__amngazeDefaultStyle || '${blurStyle.name}';
+                            var px = data.strengthPx || window.__amngazeDefaultStrengthPx || $strengthPx;
                             var list = data.verdicts || [];
                             for (var i = 0; i < list.length; i++) {
                                 var v = list[i];
@@ -320,6 +372,7 @@ class WebViewModerationBridge(
                                 } else {
                                     el.dataset.amngazeVerdict = 'SAFE';
                                     el.style.filter = '';
+                                    el.style.backgroundColor = '';
                                 }
                             }
                         } catch (e) {}
@@ -330,32 +383,48 @@ class WebViewModerationBridge(
                         var vw = Math.max(window.innerWidth || 360, 1);
                         var vh = Math.max(window.innerHeight || 640, 1);
                         var selectors = [];
-                        if (protectImages) selectors.push('img');
-                        if (protectVideos) selectors.push('video');
+                        if (protectImages) {
+                            selectors.push('img');
+                            selectors.push('picture');
+                            selectors.push('[style*="background-image"]');
+                        }
+                        if (protectVideos) {
+                            selectors.push('video');
+                        }
                         if (selectors.length === 0) return;
 
                         var nodes = document.querySelectorAll(selectors.join(','));
                         var batch = [];
+                        var hasMorePending = false;
                         var now = Date.now();
-                        for (var i = 0; i < nodes.length && batch.length < 8; i++) {
+                        for (var i = 0; i < nodes.length; i++) {
                             var el = nodes[i];
                             var tag = (el.tagName || 'IMG').toUpperCase();
                             var verdict = el.dataset.amngazeVerdict || '';
                             var lastScan = parseInt(el.dataset.amngazeLastScan || '0', 10);
 
-                            if (tag === 'IMG' && (verdict === 'SAFE' || verdict === 'BLURRED')) {
+                            if (tag !== 'VIDEO' && (verdict === 'SAFE' || verdict === 'BLURRED')) {
                                 continue;
                             }
-                            if (tag === 'VIDEO' && (now - lastScan) < 900) {
+                            if (tag === 'VIDEO' && (now - lastScan) < 750) {
                                 continue;
                             }
 
                             var rect = el.getBoundingClientRect();
-                            if (rect.width < 44 || rect.height < 44) continue;
+                            if (rect.width < 32 || rect.height < 32) continue;
                             if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) continue;
+
+                            if (batch.length >= $MAX_BATCH_TILES) {
+                                hasMorePending = true;
+                                break;
+                            }
 
                             if (!el.dataset.amngazeId) {
                                 el.dataset.amngazeId = 'ag_' + (nextId++);
+                            }
+                            if (window.__amngazePreBlurEnabled && !verdict) {
+                                el.dataset.amngazeVerdict = 'PREBLUR';
+                                applyOverlayStyle(el, window.__amngazeDefaultStyle, window.__amngazeDefaultStrengthPx);
                             }
                             el.dataset.amngazeLastScan = String(now);
                             batch.push({
@@ -372,11 +441,14 @@ class WebViewModerationBridge(
                         if (batch.length > 0) {
                             window.AmnGazeBridge.onVisibleMediaBatch(JSON.stringify(batch));
                         }
+                        if (hasMorePending) {
+                            setTimeout(collectVisibleMedia, 160);
+                        }
                     }
 
-                    setInterval(collectVisibleMedia, 220);
+                    setInterval(collectVisibleMedia, 200);
                     window.addEventListener('scroll', function() {
-                        setTimeout(collectVisibleMedia, 140);
+                        setTimeout(collectVisibleMedia, 120);
                     }, { passive: true });
                 })();
             """.trimIndent()
@@ -384,6 +456,7 @@ class WebViewModerationBridge(
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val isBatchProcessing = java.util.concurrent.atomic.AtomicBoolean(false)
 
     @Volatile
     private var attachedWebView: WebView? = null
@@ -400,12 +473,25 @@ class WebViewModerationBridge(
     fun onVisibleMediaBatch(jsonBatch: String) {
         val items = parseVisibleMediaBatchJson(jsonBatch)
         if (items.isEmpty()) return
+        if (!isBatchProcessing.compareAndSet(false, true)) return
 
         mainHandler.post {
-            val webView = attachedWebView ?: return@post
+            val webView = attachedWebView
+            if (webView == null) {
+                isBatchProcessing.set(false)
+                return@post
+            }
             val viewW = webView.width
             val viewH = webView.height
-            if (viewW <= 0 || viewH <= 0) return@post
+            if (viewW <= 0 || viewH <= 0) {
+                isBatchProcessing.set(false)
+                return@post
+            }
+
+            val currentState = stateProvider()
+            if (currentState.preBlurNewMediaUntilScanned) {
+                webView.evaluateJavascript("if(window.__amngazePrepareCleanCapture){window.__amngazePrepareCleanCapture();}", null)
+            }
 
             val targetW = VIEWPORT_CAPTURE_WIDTH
             val targetH = ((viewH.toFloat() / viewW.toFloat()) * targetW).roundToInt().coerceAtLeast(224)
@@ -418,9 +504,15 @@ class WebViewModerationBridge(
             } catch (t: Throwable) {
                 Log.w(TAG, "Could not capture WebView viewport bitmap", t)
                 null
-            } ?: return@post
-
-            val currentState = stateProvider()
+            } finally {
+                if (currentState.preBlurNewMediaUntilScanned) {
+                    webView.evaluateJavascript("if(window.__amngazeRestoreAfterCapture){window.__amngazeRestoreAfterCapture();}", null)
+                }
+            }
+            if (snapshot == null) {
+                isBatchProcessing.set(false)
+                return@post
+            }
             scope.launch(Dispatchers.Default) {
                 val verdicts = ArrayList<MediaVerdict>(items.size)
                 try {
@@ -435,32 +527,29 @@ class WebViewModerationBridge(
                                 cropRect.width(),
                                 cropRect.height()
                             )
-                            val nsfwVerdict = moderationEngine.classifyBitmap(
-                                bitmap = cropBmp,
-                                sensitivity = when (currentState.haramBlurSensitivity) {
-                                    HaramBlurSensitivity.LOW -> 0.30f
-                                    HaramBlurSensitivity.MEDIUM -> 0.50f
-                                    HaramBlurSensitivity.HIGH -> 0.78f
-                                },
-                                modelType = currentState.amnGazeModelType,
-                                includeSexyScore = currentState.includeSexyInNsfwScore
-                            )
-                            val genderCandidate = moderationEngine.classifyCropForHaramBlur(cropBmp)
-                            val shouldBlurGender = HaramBlurFilterLogic.shouldBlurCandidate(
-                                candidate = genderCandidate,
+                            val (shouldBlur, candidate) = moderationEngine.evaluateMediaCropForProtection(
+                                cropBitmap = cropBmp,
                                 targetGender = currentState.haramBlurTargetGender,
                                 sensitivity = currentState.haramBlurSensitivity
                             )
-                            val shouldBlur = nsfwVerdict.isViolation || shouldBlurGender
                             if (shouldBlur) {
                                 onDetectionRecorded()
                             }
+                            val bestConfidence = maxOf(
+                                candidate.explicitPornNudityConfidence,
+                                candidate.genderConfidence,
+                                candidate.revealingSkinConfidence
+                            )
                             verdicts.add(
                                 MediaVerdict(
                                     id = item.id,
                                     shouldBlur = shouldBlur,
-                                    reason = if (nsfwVerdict.isViolation) nsfwVerdict.categoryName else genderCandidate.gender.name,
-                                    confidence = maxOf(nsfwVerdict.confidence, genderCandidate.genderConfidence)
+                                    reason = if (candidate.explicitPornNudityConfidence >= 0.55f) {
+                                        "EXPLICIT_NSFW"
+                                    } else {
+                                        candidate.gender.name
+                                    },
+                                    confidence = bestConfidence
                                 )
                             )
                         } catch (_: Throwable) {
@@ -478,6 +567,7 @@ class WebViewModerationBridge(
                         if (!snapshot.isRecycled) snapshot.recycle()
                     } catch (_: Throwable) {
                     }
+                    isBatchProcessing.set(false)
                 }
 
                 if (verdicts.isNotEmpty()) {

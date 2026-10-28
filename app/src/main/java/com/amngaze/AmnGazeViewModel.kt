@@ -76,6 +76,7 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
                 prefs.getInt(PREFS_KEY_HARAMBLUR_OVERLAY_STYLE, HaramBlurOverlayStyle.BLUR.ordinal)
             ) { HaramBlurOverlayStyle.BLUR },
             haramBlurEffectStrength = prefs.getInt(PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH, 10).coerceIn(1, 10),
+            preBlurNewMediaUntilScanned = prefs.getBoolean(PREFS_KEY_PRE_BLUR_NEW_MEDIA, false),
 
             // In-App Protected WebView & Parental Controls
             inAppBlurStrengthPx = prefs.getInt(PREFS_KEY_IN_APP_BLUR_STRENGTH_PX, 10).coerceIn(1, 20),
@@ -322,16 +323,43 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateHaramBlurEffectStrength(strength: Int) {
         val clamped = strength.coerceIn(1, 10)
-        _state.update { it.copy(haramBlurEffectStrength = clamped) }
-        prefs.edit().putInt(PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH, clamped).apply()
+        val syncedInAppPx = (clamped * 2).coerceIn(1, 20)
+        _state.update {
+            it.copy(
+                haramBlurEffectStrength = clamped,
+                inAppBlurStrengthPx = syncedInAppPx
+            )
+        }
+        prefs.edit()
+            .putInt(PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH, clamped)
+            .putInt(PREFS_KEY_IN_APP_BLUR_STRENGTH_PX, syncedInAppPx)
+            .apply()
+    }
+
+    fun setPreBlurNewMediaUntilScanned(enabled: Boolean) {
+        _state.update { it.copy(preBlurNewMediaUntilScanned = enabled) }
+        prefs.edit().putBoolean(PREFS_KEY_PRE_BLUR_NEW_MEDIA, enabled).apply()
+    }
+
+    fun togglePreBlurNewMediaUntilScanned() {
+        setPreBlurNewMediaUntilScanned(!_state.value.preBlurNewMediaUntilScanned)
     }
 
     // --- In-App Protected WebView Hub, Connected Platforms & Parental Controls ---
 
     fun updateInAppBlurStrengthPx(strengthPx: Int) {
         val clamped = strengthPx.coerceIn(1, 20)
-        _state.update { it.copy(inAppBlurStrengthPx = clamped) }
-        prefs.edit().putInt(PREFS_KEY_IN_APP_BLUR_STRENGTH_PX, clamped).apply()
+        val syncedStrength10 = ((clamped + 1) / 2).coerceIn(1, 10)
+        _state.update {
+            it.copy(
+                inAppBlurStrengthPx = clamped,
+                haramBlurEffectStrength = syncedStrength10
+            )
+        }
+        prefs.edit()
+            .putInt(PREFS_KEY_IN_APP_BLUR_STRENGTH_PX, clamped)
+            .putInt(PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH, syncedStrength10)
+            .apply()
     }
 
     fun toggleWhatToProtectItem(item: WhatToProtectItem) {
