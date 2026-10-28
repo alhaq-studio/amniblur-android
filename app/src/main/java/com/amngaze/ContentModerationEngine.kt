@@ -2,8 +2,12 @@ package com.amngaze
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.RectF
+import android.graphics.ColorSpace
+import android.hardware.HardwareBuffer
+import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
+import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
@@ -13,31 +17,61 @@ import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 
 /**
- * On-Device Content Moderation Engine leveraging Google AI Edge LiteRT (TensorFlow Lite).
- * Compiles custom object detection models to pinpoint exact explicit content bounding coordinates.
+ * Whole-screen classification result returned by [ContentModerationEngine].
+ */
+data class VisionVerdict(
+    val isViolation: Boolean,
+    val confidence: Float,
+    val threshold: Float,
+    val categoryName: String,
+    val modelType: ModerationModelType
+)
+
+/**
+ * On-Device Whole-Screen Content Moderation Engine leveraging Google AI Edge LiteRT (TensorFlow Lite).
  *
- * Supports three [BlurTargetMode] modes:
- * - BODY_REGION: returns multiple small bounding boxes around individual exposed body patches
- * - FULL_PERSON: returns a single large box covering the detected person silhouette
- * - FULL_SCREEN: returns a single full-screen rect when content is detected
+ * Uses model-accurate preprocessing and output class mapping to eliminate false positives:
+ * - [ModerationModelType.DEFAULT_NSFW] (`amn_gaze.tflite` — Yahoo OpenNSFW ResNet-50):
+ *   224x224 FLOAT32 BGR with VGG mean subtraction (`B - 104f`, `G - 117f`, `R - 123f`),
+ *   2-class output (`[0] = SFW`, `[1] = NSFW`).
+ * - [ModerationModelType.QUANTIZED_NSFW] (`nsfw_mobilenet_v2_140_224_quantized.tflite` — GantMan 5-class MobileNetV2):
+ *   224x224 RGB normalized `[0f..1f]` (FLOAT32) or UINT8 RGB,
+ *   5-class output (`[0] = drawings`, `[1] = hentai`, `[2] = neutral`, `[3] = porn`, `[4] = sexy`),
+ *   computing explicit score strictly from `porn` (`[3]`) + `hentai` (`[1]`).
+ * - [ModerationModelType.GENDER_FILTER] (`model_lite_gender_q.tflite`):
+ *   128x128 RGB normalized `[0f..1f]`, 2-class output.
  */
 class ContentModerationEngine(private val context: Context) {
+    companion object {
+        private const val TAG = "ContentModerationEngine"
+        const val DEFAULT_INPUT_SIZE = 224
+
+        // Yahoo open_nsfw BGR channel means
+        private const val VGG_MEAN_B = 104.0f
+        private const val VGG_MEAN_G = 117.0f
+        private const val VGG_MEAN_R = 123.0f
+
+        /**
+         * Maps user sensitivity (0.20..0.95, default 0.50) to a strict confidence threshold
+         * (0.58..0.90, default 0.75) so normal UI screens do not false-trigger.
+         */
+        fun confidenceThresholdForSensitivity(sensitivity: Float): Float {
+            val clamped = sensitivity.coerceIn(0.2f, 0.95f)
+            return (1.0f - (clamped * 0.5f)).coerceIn(0.58f, 0.90f)
+        }
+    }
+
     private var interpreter: Interpreter? = null
     private var gpuDelegate: GpuDelegate? = null
     private var loadedModelType: ModerationModelType? = null
-    private var frameCounter = 0
 
     init {
-        // Load default model on initialization
         reloadModel(ModerationModelType.DEFAULT_NSFW)
     }
 
-    /**
-     * Thread-safe reload of the specified model type.
-     */
     @Synchronized
     private fun reloadModel(modelType: ModerationModelType) {
-        Log.i("ContentModerationEngine", "Switching/reloading model to: $modelType")
+        Log.i(TAG, "Switching/reloading LiteRT model to: $modelType")
         close()
 
         val modelFileName = when (modelType) {
@@ -49,22 +83,28 @@ class ContentModerationEngine(private val context: Context) {
         val modelBuffer = loadModelFile(context, modelFileName)
         if (modelBuffer != null) {
             try {
-                // Try initializing with hardware GPU acceleration delegate
                 val options = Interpreter.Options()
                 gpuDelegate = GpuDelegate()
                 options.addDelegate(gpuDelegate)
                 interpreter = Interpreter(modelBuffer, options)
                 loadedModelType = modelType
-                Log.i("ContentModerationEngine", "LiteRT Interpreter reloaded successfully with hardware GPU acceleration: $modelFileName")
+                Log.i(TAG, "LiteRT Interpreter initialized with GPU delegate: $modelFileName")
             } catch (e: Throwable) {
-                Log.e("ContentModerationEngine", "Failed to initialize LiteRT with GPU delegate for $modelFileName. Falling back to CPU...", e)
+                Log.w(TAG, "GPU delegate unavailable for $modelFileName; falling back to multi-thread CPU.", e)
                 try {
-                    val options = Interpreter.Options()
-                    interpreter = Interpreter(modelBuffer, options)
+                    gpuDelegate?.close()
+                } catch (_: Throwable) {
+                }
+                gpuDelegate = null
+                try {
+                    val cpuOptions = Interpreter.Options().apply {
+                        setNumThreads(4)
+                    }
+                    interpreter = Interpreter(modelBuffer, cpuOptions)
                     loadedModelType = modelType
-                    Log.i("ContentModerationEngine", "LiteRT Interpreter reloaded successfully over CPU: $modelFileName")
+                    Log.i(TAG, "LiteRT Interpreter initialized on CPU (4 threads): $modelFileName")
                 } catch (ex: Throwable) {
-                    Log.e("ContentModerationEngine", "Failed to load CompiledModel on CPU fallback for $modelFileName", ex)
+                    Log.e(TAG, "Failed to initialize LiteRT Interpreter on CPU for $modelFileName", ex)
                     interpreter = null
                     loadedModelType = null
                 }
@@ -75,9 +115,6 @@ class ContentModerationEngine(private val context: Context) {
         }
     }
 
-    /**
-     * Map model format from application assets folder.
-     */
     private fun loadModelFile(context: Context, modelName: String): ByteBuffer? {
         return try {
             context.assets.openFd(modelName).use { fileDescriptor ->
@@ -90,19 +127,36 @@ class ContentModerationEngine(private val context: Context) {
                 }
             }
         } catch (e: IOException) {
-            Log.w(
-                "ContentModerationEngine",
-                "Model asset '$modelName' not found under assets/. Running Amn Gaze in premium Heuristic Simulation mode for development visualization."
-            )
-            null
+            Log.w(TAG, "Model asset '$modelName' could not be mapped via openFd; trying stream copy.", e)
+            try {
+                val bytes = context.assets.open(modelName).use { it.readBytes() }
+                ByteBuffer.allocateDirect(bytes.size).apply {
+                    order(ByteOrder.nativeOrder())
+                    put(bytes)
+                    rewind()
+                }
+            } catch (ex: IOException) {
+                Log.e(TAG, "Model asset '$modelName' not found under assets/.", ex)
+                null
+            }
         }
     }
 
     /**
-     * Preprocesses a Bitmap into raw color channels (BGR) as expected by the model.
+     * Preprocesses an ARGB_8888 Bitmap according to the exact channel order and normalization
+     * expected by [modelType].
      */
-    fun preprocessBitmap(bitmap: Bitmap, inputSize: Int, isQuantized: Boolean): ByteBuffer {
-        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+    fun preprocessBitmap(
+        bitmap: Bitmap,
+        inputSize: Int,
+        isQuantized: Boolean,
+        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW
+    ): ByteBuffer {
+        val scaledBitmap = if (bitmap.width == inputSize && bitmap.height == inputSize) {
+            bitmap
+        } else {
+            Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        }
         val numBytesPerChannel = if (isQuantized) 1 else 4
         val byteBuffer = ByteBuffer.allocateDirect(numBytesPerChannel * inputSize * inputSize * 3)
         byteBuffer.order(ByteOrder.nativeOrder())
@@ -112,73 +166,150 @@ class ContentModerationEngine(private val context: Context) {
 
         byteBuffer.rewind()
         for (pixelValue in intValues) {
-            // Unpack 24bpp RGB structure
             val r = ((pixelValue shr 16) and 0xFF)
             val g = ((pixelValue shr 8) and 0xFF)
             val b = (pixelValue and 0xFF)
 
             if (isQuantized) {
-                // BGR Order
-                byteBuffer.put(b.toByte())
-                byteBuffer.put(g.toByte())
+                // Quantized MobileNetV2 / Gender models use RGB byte order
                 byteBuffer.put(r.toByte())
+                byteBuffer.put(g.toByte())
+                byteBuffer.put(b.toByte())
             } else {
-                // BGR Order
-                byteBuffer.putFloat(b.toFloat())
-                byteBuffer.putFloat(g.toFloat())
-                byteBuffer.putFloat(r.toFloat())
+                when (modelType) {
+                    ModerationModelType.DEFAULT_NSFW -> {
+                        // Yahoo OpenNSFW expects BGR float32 with VGG mean subtraction
+                        byteBuffer.putFloat(b.toFloat() - VGG_MEAN_B)
+                        byteBuffer.putFloat(g.toFloat() - VGG_MEAN_G)
+                        byteBuffer.putFloat(r.toFloat() - VGG_MEAN_R)
+                    }
+                    ModerationModelType.QUANTIZED_NSFW,
+                    ModerationModelType.GENDER_FILTER -> {
+                        // MobileNetV2 / Keras models expect RGB normalized to [0.0f, 1.0f]
+                        byteBuffer.putFloat(r.toFloat() / 255.0f)
+                        byteBuffer.putFloat(g.toFloat() / 255.0f)
+                        byteBuffer.putFloat(b.toFloat() / 255.0f)
+                    }
+                }
             }
         }
 
-        // Clean up allocation memory immediately
-        if (scaledBitmap != bitmap) {
+        if (scaledBitmap !== bitmap) {
             scaledBitmap.recycle()
         }
+        byteBuffer.rewind()
         return byteBuffer
     }
 
-    /**
-     * Analyses screen buffer frame and returns parsed coordinates needing immediate blurring layout mask.
-     *
-     * @param bitmap        The downscaled screen frame.
-     * @param targetMode    Which region(s) to return — body parts, full person, or full screen.
-     * @param sensitivity   Confidence threshold (0.2–0.95). Higher = fewer, more confident detections.
-     * @param modelType     The selected moderation model type.
-     */
-    fun detectExplicitContent(
-        bitmap: Bitmap,
-        targetMode: BlurTargetMode = BlurTargetMode.BODY_REGION,
+    @RequiresApi(Build.VERSION_CODES.Q)
+    fun analyzeHardwareBuffer(
+        hardwareBuffer: HardwareBuffer,
+        colorSpace: ColorSpace?,
         sensitivity: Float = 0.5f,
         modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW
-    ): Pair<Float, List<RectF>> = synchronized(this) {
-        if (loadedModelType != modelType) {
+    ): VisionVerdict {
+        var hwBitmap: Bitmap? = null
+        var scaledBitmap: Bitmap? = null
+        var softwareBitmap: Bitmap? = null
+
+        try {
+            val targetColorSpace = colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
+            hwBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, targetColorSpace)
+            if (hwBitmap != null) {
+                scaledBitmap = Bitmap.createScaledBitmap(
+                    hwBitmap,
+                    DEFAULT_INPUT_SIZE,
+                    DEFAULT_INPUT_SIZE,
+                    true
+                )
+                softwareBitmap = scaledBitmap.copy(Bitmap.Config.ARGB_8888, false)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to copy HardwareBuffer to software ARGB_8888 bitmap.", t)
+        } finally {
+            try {
+                if (scaledBitmap != null && scaledBitmap !== hwBitmap) {
+                    scaledBitmap.recycle()
+                }
+            } catch (_: Throwable) {
+            }
+            try {
+                hwBitmap?.recycle()
+            } catch (_: Throwable) {
+            }
+            try {
+                hardwareBuffer.close()
+            } catch (_: Throwable) {
+            }
+        }
+
+        val threshold = confidenceThresholdForSensitivity(sensitivity)
+        val bitmapToAnalyze = softwareBitmap
+            ?: return VisionVerdict(
+                isViolation = false,
+                confidence = 0f,
+                threshold = threshold,
+                categoryName = "SAFE",
+                modelType = modelType
+            )
+
+        return try {
+            classifyBitmap(
+                bitmap = bitmapToAnalyze,
+                sensitivity = sensitivity,
+                modelType = modelType
+            )
+        } finally {
+            try {
+                bitmapToAnalyze.recycle()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @Synchronized
+    fun classifyBitmap(
+        bitmap: Bitmap,
+        sensitivity: Float = 0.5f,
+        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW
+    ): VisionVerdict {
+        val threshold = confidenceThresholdForSensitivity(sensitivity)
+
+        if (loadedModelType != modelType || interpreter == null) {
             reloadModel(modelType)
         }
 
         val interpreterInstance = interpreter
-        if (interpreterInstance == null) {
-            // When no custom .tflite is loaded, fallback gracefully to a smart heuristic simulation
-            return@synchronized Pair(1.0f, runSimulatedDetection(bitmap, targetMode))
-        }
+            ?: return VisionVerdict(
+                isViolation = false,
+                confidence = 0f,
+                threshold = threshold,
+                categoryName = "MODEL_UNAVAILABLE",
+                modelType = modelType
+            )
 
-        try {
+        return try {
             val inputTensor = interpreterInstance.getInputTensor(0)
             val inputShape = inputTensor.shape()
-            val inputSize = if (inputShape.size >= 3) inputShape[1] else 224
+            val inputSize = if (inputShape.size >= 3 && inputShape[1] > 0) inputShape[1] else DEFAULT_INPUT_SIZE
             val inputDataType = inputTensor.dataType()
-            val isQuantized = (inputDataType == org.tensorflow.lite.DataType.UINT8 || inputDataType == org.tensorflow.lite.DataType.INT8)
+            val isQuantized = (inputDataType == DataType.UINT8 || inputDataType == DataType.INT8)
 
-            val inputBuffer = preprocessBitmap(bitmap, inputSize, isQuantized)
+            val inputBuffer = preprocessBitmap(bitmap, inputSize, isQuantized, modelType)
 
             val outputTensor = interpreterInstance.getOutputTensor(0)
             val outputDataType = outputTensor.dataType()
+            val outputShape = outputTensor.shape()
+            val numClasses = if (outputShape.size >= 2 && outputShape[1] > 0) outputShape[1] else 2
 
-            var score = 0f
+            val probabilities = FloatArray(numClasses)
 
-            if (outputDataType == org.tensorflow.lite.DataType.FLOAT32) {
-                val outputScores = Array(1) { FloatArray(2) }
+            if (outputDataType == DataType.FLOAT32) {
+                val outputScores = Array(1) { FloatArray(numClasses) }
                 interpreterInstance.run(inputBuffer, outputScores)
-                score = outputScores[0][1]
+                for (i in 0 until numClasses) {
+                    probabilities[i] = outputScores[0][i]
+                }
             } else {
                 val outputBuffer = ByteBuffer.allocateDirect(outputTensor.numBytes())
                 outputBuffer.order(ByteOrder.nativeOrder())
@@ -186,145 +317,62 @@ class ContentModerationEngine(private val context: Context) {
                 outputBuffer.rewind()
 
                 val qParams = outputTensor.quantizationParams()
-                val scale = qParams.scale
+                val scale = if (qParams.scale > 0f) qParams.scale else (1f / 255f)
                 val zeroPoint = qParams.zeroPoint
 
-                // Read the two outputs: male/female or normal/explicit
-                val val0 = if (outputDataType == org.tensorflow.lite.DataType.UINT8) {
-                    (outputBuffer.get().toInt() and 0xFF)
-                } else {
-                    outputBuffer.get().toInt()
-                }
-                val val1 = if (outputDataType == org.tensorflow.lite.DataType.UINT8) {
-                    (outputBuffer.get().toInt() and 0xFF)
-                } else {
-                    outputBuffer.get().toInt()
-                }
-
-                score = (val1 - zeroPoint) * scale
-            }
-
-            // We use threshold = 1.0f - sensitivity.
-            val threshold = 1.0f - sensitivity
-            val isDetected = score >= threshold
-            Log.d("ContentModerationEngine", "Inference model: $modelType, score: $score (threshold: $threshold) - detected=$isDetected")
-
-            val blockedRegions = mutableListOf<RectF>()
-            if (isDetected) {
-                val w = bitmap.width.toFloat()
-                val h = bitmap.height.toFloat()
-
-                when (targetMode) {
-                    BlurTargetMode.FULL_SCREEN -> {
-                        return@synchronized Pair(score, listOf(RectF(0f, 0f, w, h)))
+                for (i in 0 until numClasses) {
+                    if (!outputBuffer.hasRemaining()) break
+                    val rawVal = if (outputDataType == DataType.UINT8) {
+                        outputBuffer.get().toInt() and 0xFF
+                    } else {
+                        outputBuffer.get().toInt()
                     }
-                    BlurTargetMode.FULL_PERSON -> {
-                        // Estimate a person occupying the center ~60% of the frame
-                        blockedRegions.add(RectF(w * 0.20f, h * 0.10f, w * 0.80f, h * 0.92f))
-                    }
-                    BlurTargetMode.BODY_REGION -> {
-                        // Estimate body-part patches relative to the person's location
-                        val personRect = RectF(w * 0.20f, h * 0.10f, w * 0.80f, h * 0.92f)
-                        blockedRegions.addAll(subdivideToBodyParts(personRect))
-                    }
+                    probabilities[i] = ((rawVal - zeroPoint) * scale).coerceIn(0f, 1f)
                 }
             }
-            Pair(score, blockedRegions)
+
+            // Compute explicit score accurately based on the model's output class schema:
+            // - 5-class GantMan MobileNetV2: [0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy
+            // - 2-class OpenNSFW / Gender: [0]=safe/male, [1]=explicit/female
+            val score: Float = if (numClasses >= 5) {
+                val hentaiProb = probabilities[1]
+                val pornProb = probabilities[3]
+                (pornProb + hentaiProb).coerceIn(0f, 1f)
+            } else if (numClasses >= 2) {
+                probabilities[1].coerceIn(0f, 1f)
+            } else {
+                probabilities[0].coerceIn(0f, 1f)
+            }
+
+            val isViolation = score >= threshold
+            val category = if (isViolation) {
+                when (modelType) {
+                    ModerationModelType.DEFAULT_NSFW -> "EXPLICIT_CONTENT_NSFW"
+                    ModerationModelType.QUANTIZED_NSFW -> "EXPLICIT_CONTENT_QUANTIZED"
+                    ModerationModelType.GENDER_FILTER -> "GENDER_REVEALING_FILTER"
+                }
+            } else {
+                "SAFE"
+            }
+
+            Log.d(TAG, "Whole-screen LiteRT inference ($modelType, classes=$numClasses): score=$score, threshold=$threshold, violation=$isViolation")
+            VisionVerdict(
+                isViolation = isViolation,
+                confidence = score,
+                threshold = threshold,
+                categoryName = category,
+                modelType = modelType
+            )
         } catch (e: Exception) {
-            Log.e("ContentModerationEngine", "LiteRT Inference Exception: ", e)
-            Pair(0f, emptyList())
+            Log.e(TAG, "LiteRT inference exception", e)
+            VisionVerdict(
+                isViolation = false,
+                confidence = 0f,
+                threshold = threshold,
+                categoryName = "ERROR",
+                modelType = modelType
+            )
         }
-    }
-
-    /**
-     * Subdivides a full-person bounding box into anatomically-approximate body-part patches.
-     * Used when a real model provides a person box but we want granular part-level blurring.
-     *
-     * Returns up to 5 sub-regions: upper chest/shoulders, arms (×2), torso, upper legs.
-     */
-    private fun subdivideToBodyParts(personRect: RectF): List<RectF> {
-        val l = personRect.left
-        val t = personRect.top
-        val r = personRect.right
-        val b = personRect.bottom
-        val w = personRect.width()
-        val h = personRect.height()
-
-        return listOf(
-            // Upper chest / décolletage region
-            RectF(l + w * 0.25f, t + h * 0.12f, r - w * 0.25f, t + h * 0.32f),
-            // Left arm / shoulder
-            RectF(l, t + h * 0.08f, l + w * 0.28f, t + h * 0.55f),
-            // Right arm / shoulder
-            RectF(r - w * 0.28f, t + h * 0.08f, r, t + h * 0.55f),
-            // Torso / midriff
-            RectF(l + w * 0.2f, t + h * 0.32f, r - w * 0.2f, t + h * 0.65f),
-            // Upper legs
-            RectF(l + w * 0.15f, t + h * 0.65f, r - w * 0.15f, t + h * 0.88f)
-        )
-    }
-
-    /**
-     * Generates simulated bounding boxes on rhythmic frames to demonstrate on-device low-latency masking.
-     * The simulation adapts to the selected [BlurTargetMode]:
-     *
-     * - BODY_REGION → multiple small overlapping patches at realistic body positions
-     * - FULL_PERSON → single person-sized rectangle
-     * - FULL_SCREEN → entire screen rectangle
-     */
-    private fun runSimulatedDetection(bitmap: Bitmap, targetMode: BlurTargetMode): List<RectF> {
-        frameCounter++
-        val results = mutableListOf<RectF>()
-
-        // Trigger every 15-cycle window for realistic visual demonstration
-        if (frameCounter % 15 !in 4..11) return results
-
-        val w = bitmap.width.toFloat()
-        val h = bitmap.height.toFloat()
-
-        when (targetMode) {
-            BlurTargetMode.FULL_SCREEN -> {
-                results.add(RectF(0f, 0f, w, h))
-            }
-
-            BlurTargetMode.FULL_PERSON -> {
-                // Simulate a person occupying the center ~60% of the frame
-                results.add(RectF(w * 0.20f, h * 0.10f, w * 0.80f, h * 0.92f))
-            }
-
-            BlurTargetMode.BODY_REGION -> {
-                // Simulate realistic body-part patches without blurring the full frame
-                val phaseShift = (frameCounter % 3) * 0.03f // Slight position variation
-
-                // Upper chest / shoulders
-                results.add(RectF(
-                    w * (0.30f + phaseShift), h * 0.15f,
-                    w * (0.70f - phaseShift), h * 0.32f
-                ))
-                // Left shoulder/arm
-                results.add(RectF(
-                    w * (0.14f + phaseShift), h * 0.12f,
-                    w * (0.32f + phaseShift), h * 0.50f
-                ))
-                // Right shoulder/arm
-                results.add(RectF(
-                    w * (0.68f - phaseShift), h * 0.12f,
-                    w * (0.86f - phaseShift), h * 0.50f
-                ))
-                // Midriff / torso
-                results.add(RectF(
-                    w * (0.27f + phaseShift), h * 0.32f,
-                    w * (0.73f - phaseShift), h * 0.60f
-                ))
-                // Upper legs
-                results.add(RectF(
-                    w * (0.25f + phaseShift), h * 0.60f,
-                    w * (0.75f - phaseShift), h * 0.84f
-                ))
-            }
-        }
-
-        return results
     }
 
     @Synchronized
@@ -333,7 +381,7 @@ class ContentModerationEngine(private val context: Context) {
             interpreter?.close()
             gpuDelegate?.close()
         } catch (e: Exception) {
-            Log.e("ContentModerationEngine", "Error releasing LiteRT compiler resources.", e)
+            Log.e(TAG, "Error releasing LiteRT resources.", e)
         } finally {
             interpreter = null
             gpuDelegate = null

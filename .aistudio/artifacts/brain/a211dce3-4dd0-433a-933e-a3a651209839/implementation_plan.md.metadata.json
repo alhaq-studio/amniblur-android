@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for fixing on-device image, lazy-loaded web frame, and video NSFW detection across ContentModerationEngine, ProtectionPipelineLogic, AmnGazeAccessibilityService, and the MainDashboardScreen UI controls.",
+  "updatedAt":  "2026-10-28T00:14:47.461510158Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

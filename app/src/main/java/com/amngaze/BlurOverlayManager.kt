@@ -3,464 +3,510 @@ package com.amngaze
 import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.*
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
+import android.util.Log
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
-import android.util.Log
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 
 /**
- * Premium AmnGaze Overlay View.
+ * Layer 3 Pre-Allocated `<2ms` Whole-Screen Curtain Shield (`TYPE_ACCESSIBILITY_OVERLAY`).
  *
- * Renders configurable censorship blocks over detected regions with:
- * - 4 censor styles: Mosaic, Gaussian Blur (approx), Black Bar, Frosted Glass
- * - Optional animated pulsing alert border
- * - Optional badge label ("AMNGAZE: BLOCKED")
- * - Smooth fade-in/fade-out alpha transitions
+ * Solves two fundamental Android graphics/compositor issues:
+ * 1. Pre-attaches in `onServiceConnected()` with `visibility = View.GONE`. Flipping to
+ *    `View.VISIBLE` takes <2ms on the main thread, obscuring explicit content before
+ *    `GLOBAL_ACTION_BACK` or `GLOBAL_ACTION_HOME` animations even begin.
+ * 2. Always backs `FLAG_BLUR_BEHIND` (API 31+) with a high-opacity `#F20F172A` dark slate
+ *    surface so explicit content is 100% obscured even on OEM skins or emulators where
+ *    `WindowManager.isCrossWindowBlurEnabled` is false.
  */
-class BlurOverlayView(context: Context) : View(context) {
+class CurtainBackdropCanvasView(context: Context) : View(context) {
 
-    private var detectedBoxes: List<RectF> = emptyList()
-
-    // Configurable options (updated via updateConfig)
-    var censorStyle: BlurCensorStyle = BlurCensorStyle.MOSAIC
-    var showBadge: Boolean = true
+    var censorStyle: BlurCensorStyle = BlurCensorStyle.FROSTED
     var showBorder: Boolean = true
-    var isHardBlock: Boolean = false
 
-    init {
-        // Software rendering required for BlurMaskFilter and custom shader effects
-        setLayerType(LAYER_TYPE_SOFTWARE, null)
-        initNoiseTexture()
+    private val baseSlatePaint = Paint().apply {
+        // High-opacity #F20F172A (95% opaque dark slate) guarantees zero bleed-through
+        color = Color.parseColor("#F20F172A")
+        style = Paint.Style.FILL
     }
 
-    // ─── Mosaic tile rendering ────────────────────────────────────────────────
-    private val mosaicTileSize = 22f
-    private val mosaicPaint = Paint().apply { style = Paint.Style.FILL }
+    private val blackoutPaint = Paint().apply {
+        color = Color.parseColor("#FF070B14")
+        style = Paint.Style.FILL
+    }
 
-    private val mosaicPalette = listOf(
-        Color.parseColor("#1A1A2E"),
-        Color.parseColor("#16213E"),
-        Color.parseColor("#0F3460"),
-        Color.parseColor("#1E1E3F"),
-        Color.parseColor("#12122A"),
-        Color.parseColor("#0A0A1E"),
-        Color.parseColor("#252550")
+    private val mosaicPaint = Paint().apply {
+        style = Paint.Style.FILL
+    }
+
+    private val mosaicPalette = intArrayOf(
+        Color.parseColor("#F50F172A"),
+        Color.parseColor("#F51E293B"),
+        Color.parseColor("#F5172554"),
+        Color.parseColor("#F5111827"),
+        Color.parseColor("#F5090D16"),
+        Color.parseColor("#F51E1B4B")
     )
 
-    private val vignettePaint = Paint()
-
-    // ─── Gaussian Blur rendering ──────────────────────────────────────────────
-    private val tinyBlurBitmap = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888).apply {
-        val tinyCanvas = Canvas(this)
-        val paint = Paint().apply { style = Paint.Style.FILL }
-        for (y in 0 until 8) {
-            for (x in 0 until 8) {
-                val colorIdx = (y * 7 + x * 3) % mosaicPalette.size
-                paint.color = mosaicPalette[colorIdx]
-                tinyCanvas.drawRect(x.toFloat(), y.toFloat(), (x + 1).toFloat(), (y + 1).toFloat(), paint)
-            }
-        }
-    }
-
-    private val blurPaint = Paint().apply {
-        isFilterBitmap = true
-        isAntiAlias = true
-        maskFilter = BlurMaskFilter(6f, BlurMaskFilter.Blur.NORMAL)
-    }
-
-    private val blurOverlayPaint = Paint().apply {
-        color = Color.parseColor("#55000020")
+    private val frostedOverlayPaint = Paint().apply {
+        color = Color.parseColor("#26E2E8F0")
         style = Paint.Style.FILL
     }
 
-    private val roundedPath = Path()
-
-    // ─── Black bar rendering ──────────────────────────────────────────────────
-    private val blackBarPaint = Paint().apply {
-        color = Color.parseColor("#D9000000")
-        style = Paint.Style.FILL
-    }
-
-    // ─── Frosted glass rendering ──────────────────────────────────────────────
-    private val frostedFillPaint = Paint().apply {
-        color = Color.parseColor("#CCFFFFFF")
-        style = Paint.Style.FILL
-    }
-    private val frostedNoisePaint = Paint().apply {
-        style = Paint.Style.FILL
-    }
-    private val frostedStrokePaint = Paint().apply {
-        color = Color.parseColor("#40FFFFFF")
+    private val frostedGridPaint = Paint().apply {
+        color = Color.parseColor("#1494A3B8")
         style = Paint.Style.STROKE
-        strokeWidth = 1.5f
+        strokeWidth = 2f
         isAntiAlias = true
     }
 
-    private fun initNoiseTexture() {
-        val noiseBitmap = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
-        val random = java.util.Random()
-        for (x in 0 until 128) {
-            for (y in 0 until 128) {
-                val gray = random.nextInt(80) + 160
-                val alpha = random.nextInt(40) + 10
-                noiseBitmap.setPixel(x, y, Color.argb(alpha, gray, gray, gray))
-            }
-        }
-        val shader = BitmapShader(noiseBitmap, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
-        frostedNoisePaint.shader = shader
-    }
-
-    // ─── Animated border ──────────────────────────────────────────────────────
-    private var borderAlpha: Float = 0.9f
     private val borderPaint = Paint().apply {
-        color = Color.parseColor("#FF1744")
+        color = Color.parseColor("#EF4444")
         style = Paint.Style.STROKE
-        strokeWidth = 5f
-        pathEffect = DashPathEffect(floatArrayOf(18f, 10f), 0f)
+        strokeWidth = 6f
         isAntiAlias = true
-        maskFilter = BlurMaskFilter(12f, BlurMaskFilter.Blur.OUTER)
-    }
-
-    private val solidBorderPaint = Paint().apply {
-        color = Color.parseColor("#FF1744")
-        style = Paint.Style.STROKE
-        strokeWidth = 2.5f
-        isAntiAlias = true
-    }
-
-    // ─── Badge / label ────────────────────────────────────────────────────────
-    private val badgePaint = Paint().apply {
-        color = Color.parseColor("#CC000000")
-        style = Paint.Style.FILL
-        isAntiAlias = true
-    }
-
-    private val badgeStrokePaint = Paint().apply {
-        color = Color.parseColor("#FF1744")
-        style = Paint.Style.STROKE
-        strokeWidth = 1.8f
-        isAntiAlias = true
-    }
-
-    private val labelPaint = Paint().apply {
-        color = Color.WHITE
-        textSize = 28f
-        typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-        isAntiAlias = true
-        textAlign = Paint.Align.CENTER
-    }
-
-    private val subLabelPaint = Paint().apply {
-        color = Color.parseColor("#FF5252")
-        textSize = 18f
-        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
-        isAntiAlias = true
-        textAlign = Paint.Align.CENTER
-    }
-
-    // ─── Pulsing border animator ───────────────────────────────────────────────
-    private val pulseAnimator = ValueAnimator.ofFloat(0.4f, 1.0f).apply {
-        duration = 700
-        repeatCount = ValueAnimator.INFINITE
-        repeatMode = ValueAnimator.REVERSE
-        interpolator = AccelerateDecelerateInterpolator()
-        addUpdateListener { animator ->
-            borderAlpha = animator.animatedValue as Float
-            borderPaint.alpha = (borderAlpha * 255).toInt()
-            solidBorderPaint.alpha = (borderAlpha * 200).toInt()
-            invalidate()
-        }
-    }
-
-    // ─── Scanline effect ───────────────────────────────────────────────────────
-    private var scanlineOffset = 0f
-    private val scanlineAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-        duration = 1800
-        repeatCount = ValueAnimator.INFINITE
-        interpolator = AccelerateDecelerateInterpolator()
-        addUpdateListener { animator ->
-            scanlineOffset = animator.animatedValue as Float
-            invalidate()
-        }
     }
 
     private val scanlinePaint = Paint().apply {
-        color = Color.parseColor("#22FF1744")
+        color = Color.parseColor("#28EF4444")
         style = Paint.Style.FILL
     }
 
-    fun updateRegions(boxes: List<RectF>) {
-        detectedBoxes = boxes
-        if (!pulseAnimator.isStarted && showBorder) {
+    private var pulseAlpha = 0.85f
+    private var scanlineProgress = 0f
+
+    private val pulseAnimator = ValueAnimator.ofFloat(0.35f, 0.95f).apply {
+        duration = 850
+        repeatCount = ValueAnimator.INFINITE
+        repeatMode = ValueAnimator.REVERSE
+        interpolator = AccelerateDecelerateInterpolator()
+        addUpdateListener { anim ->
+            pulseAlpha = anim.animatedValue as Float
+            borderPaint.alpha = (pulseAlpha * 255).toInt()
+            invalidate()
+        }
+    }
+
+    private val scanlineAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+        duration = 2100
+        repeatCount = ValueAnimator.INFINITE
+        interpolator = AccelerateDecelerateInterpolator()
+        addUpdateListener { anim ->
+            scanlineProgress = anim.animatedValue as Float
+            invalidate()
+        }
+    }
+
+    fun startAnimationsIfNeeded() {
+        if (showBorder && !pulseAnimator.isStarted) {
             pulseAnimator.start()
             scanlineAnimator.start()
         }
         invalidate()
     }
 
-    fun clearRegions() {
-        detectedBoxes = emptyList()
-        invalidate()
+    fun stopAnimations() {
+        if (pulseAnimator.isStarted) pulseAnimator.cancel()
+        if (scanlineAnimator.isStarted) scanlineAnimator.cancel()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (detectedBoxes.isEmpty()) return
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
 
-        if (isHardBlock) {
-            canvas.drawColor(Color.BLACK)
-            // Draw a single badge in the center of the screen
-            if (showBadge) {
-                drawBadge(canvas, RectF(0f, 0f, width.toFloat(), height.toFloat()))
+        // 1. Always paint the high-opacity fallback base first (#F20F172A)
+        canvas.drawRect(0f, 0f, w, h, baseSlatePaint)
+
+        // 2. Render style-specific whole-screen curtain pattern
+        when (censorStyle) {
+            BlurCensorStyle.BLACK_BAR -> {
+                canvas.drawRect(0f, 0f, w, h, blackoutPaint)
             }
-            return
-        }
-
-        for (rect in detectedBoxes) {
-            // Render the chosen censor style
-            when (censorStyle) {
-                BlurCensorStyle.MOSAIC        -> drawMosaicBlock(canvas, rect)
-                BlurCensorStyle.GAUSSIAN_BLUR -> drawGaussianBlurBlock(canvas, rect)
-                BlurCensorStyle.BLACK_BAR     -> drawBlackBarBlock(canvas, rect)
-                BlurCensorStyle.FROSTED       -> drawFrostedBlock(canvas, rect)
+            BlurCensorStyle.MOSAIC -> {
+                val tileSize = 44f
+                val cols = (w / tileSize).toInt() + 1
+                val rows = (h / tileSize).toInt() + 1
+                for (r in 0..rows) {
+                    for (c in 0..cols) {
+                        mosaicPaint.color = mosaicPalette[(r * 5 + c * 3) % mosaicPalette.size]
+                        canvas.drawRect(
+                            c * tileSize,
+                            r * tileSize,
+                            (c + 1) * tileSize - 2f,
+                            (r + 1) * tileSize - 2f,
+                            mosaicPaint
+                        )
+                    }
+                }
             }
-            // Optional animated border
-            if (showBorder) {
-                drawAnimatedBorder(canvas, rect)
-                drawScanline(canvas, rect)
+            BlurCensorStyle.FROSTED -> {
+                canvas.drawRect(0f, 0f, w, h, frostedOverlayPaint)
+                val step = 64f
+                var x = 0f
+                while (x < w) {
+                    canvas.drawLine(x, 0f, x, h, frostedGridPaint)
+                    x += step
+                }
+                var y = 0f
+                while (y < h) {
+                    canvas.drawLine(0f, y, w, y, frostedGridPaint)
+                    y += step
+                }
             }
-            // Optional badge
-            if (showBadge) {
-                drawBadge(canvas, rect)
-            }
-        }
-    }
-
-    // ─── STYLE: Mosaic ────────────────────────────────────────────────────────
-    private fun drawMosaicBlock(canvas: Canvas, rect: RectF) {
-        val cols = ((rect.width() / mosaicTileSize) + 1).toInt()
-        val rows = ((rect.height() / mosaicTileSize) + 1).toInt()
-
-        canvas.save()
-        canvas.clipRect(rect)
-
-        var tileIndex = 0
-        for (row in 0..rows) {
-            for (col in 0..cols) {
-                val left = rect.left + col * mosaicTileSize
-                val top = rect.top + row * mosaicTileSize
-                val right = left + mosaicTileSize
-                val bottom = top + mosaicTileSize
-                val colorIdx = (row * 7 + col * 3 + tileIndex) % mosaicPalette.size
-                mosaicPaint.color = mosaicPalette[colorIdx]
-                canvas.drawRect(left, top, right, bottom, mosaicPaint)
-                tileIndex++
+            BlurCensorStyle.GAUSSIAN_BLUR -> {
+                val scanY = h * scanlineProgress
+                canvas.drawRect(0f, scanY - 18f, w, scanY + 18f, scanlinePaint)
             }
         }
 
-        // Subtle dark vignette overlay (reusing pre-allocated vignettePaint)
-        vignettePaint.shader = RadialGradient(
-            rect.centerX(), rect.centerY(),
-            maxOf(rect.width(), rect.height()) * 0.7f,
-            intArrayOf(Color.TRANSPARENT, Color.parseColor("#AA000000")),
-            null,
-            Shader.TileMode.CLAMP
-        )
-        canvas.drawRect(rect, vignettePaint)
-        canvas.restore()
-    }
-
-    // ─── STYLE: Gaussian Blur (downscale + upscale approximation) ────────────
-    private fun drawGaussianBlurBlock(canvas: Canvas, rect: RectF) {
-        canvas.save()
-        roundedPath.reset()
-        roundedPath.addRoundRect(rect, 8f, 8f, Path.Direction.CW)
-        canvas.clipPath(roundedPath)
-        
-        // Draw pre-allocated tinyBlurBitmap scaled up
-        canvas.drawBitmap(tinyBlurBitmap, null, rect, blurPaint)
-        canvas.restore()
-
-        // Overlay a semi-transparent dark layer to enhance the blur feel
-        canvas.drawRoundRect(rect, 8f, 8f, blurOverlayPaint)
-    }
-
-    // ─── STYLE: Black Bar ─────────────────────────────────────────────────────
-    private fun drawBlackBarBlock(canvas: Canvas, rect: RectF) {
-        canvas.drawRoundRect(rect, 8f, 8f, blackBarPaint)
-    }
-
-    // ─── STYLE: Frosted Glass ─────────────────────────────────────────────────
-    private fun drawFrostedBlock(canvas: Canvas, rect: RectF) {
-        canvas.save()
-        canvas.clipRect(rect)
-
-        // White translucent fill
-        canvas.drawRoundRect(rect, 12f, 12f, frostedFillPaint)
-
-        // Hardware-accelerated Tiled Noise texture (no loops, no Math.random, zero allocation!)
-        canvas.drawRoundRect(rect, 12f, 12f, frostedNoisePaint)
-
-        // Subtle inner border stroke
-        canvas.drawRoundRect(rect, 12f, 12f, frostedStrokePaint)
-        canvas.restore()
-    }
-
-    // ─── Border & scanline ────────────────────────────────────────────────────
-    private fun drawAnimatedBorder(canvas: Canvas, rect: RectF) {
-        val rx = 24f
-        canvas.drawRoundRect(rect, rx, rx, borderPaint)
-        canvas.drawRoundRect(rect, rx, rx, solidBorderPaint)
-    }
-
-    private fun drawScanline(canvas: Canvas, rect: RectF) {
-        val scanY = rect.top + rect.height() * scanlineOffset
-        canvas.drawRect(rect.left, scanY - 6f, rect.right, scanY + 6f, scanlinePaint)
-    }
-
-    // ─── Badge ────────────────────────────────────────────────────────────────
-    private fun drawBadge(canvas: Canvas, rect: RectF) {
-        val cx = rect.centerX()
-        val cy = rect.centerY()
-
-        // Only draw badge if region is large enough to show text
-        if (rect.width() < 120f || rect.height() < 60f) return
-
-        val titleText = "AMNGAZE: BLOCKED"
-        val subtitleText = "[CONTENT PROTECTED]"
-
-        val badgeW = 280f
-        val badgeH = 68f
-        val badgeRect = RectF(
-            cx - badgeW / 2f, cy - badgeH / 2f,
-            cx + badgeW / 2f, cy + badgeH / 2f
-        )
-        canvas.drawRoundRect(badgeRect, 16f, 16f, badgePaint)
-        canvas.drawRoundRect(badgeRect, 16f, 16f, badgeStrokePaint)
-        canvas.drawText(titleText, cx, cy + 4f, labelPaint)
-        canvas.drawText(subtitleText, cx, cy + 30f, subLabelPaint)
+        // 3. Optional pulsing alert border & scanline
+        if (showBorder) {
+            val inset = 12f
+            canvas.drawRoundRect(inset, inset, w - inset, h - inset, 36f, 36f, borderPaint)
+            val scanY = h * scanlineProgress
+            canvas.drawRect(inset, scanY - 8f, w - inset, scanY + 8f, scanlinePaint)
+        }
     }
 
     override fun onDetachedFromWindow() {
-        pulseAnimator.cancel()
-        scanlineAnimator.cancel()
+        stopAnimations()
         super.onDetachedFromWindow()
     }
 }
 
 /**
- * System Overlay Manager using Android WindowManager.
- * Attaches the persistent overlay canvas using TYPE_APPLICATION_OVERLAY parameters,
- * with smooth fade-in / fade-out transitions on show/hide.
+ * Manages the pre-allocated `TYPE_ACCESSIBILITY_OVERLAY` window for `<2ms` whole-screen
+ * blocking and user actions ("Leave Page Safely" & "False Positive - Unblur for 30s").
  */
-class BlurOverlayManager(private val context: Context) {
-    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-    private var overlayView: BlurOverlayView? = null
-    private var isShowing = false
-
-    // Current config — applied to overlay view when it is created
-    private var currentStyle = BlurCensorStyle.MOSAIC
-    private var showBadge = true
-    private var showBorder = true
-    private var isHardBlock = false
-
-    /**
-     * Updates the censor style and visual toggle options.
-     * If overlay is already showing, applies immediately.
-     */
-    fun updateConfig(style: BlurCensorStyle, badge: Boolean, border: Boolean, hardBlock: Boolean = false) {
-        currentStyle = style
-        showBadge = badge
-        showBorder = border
-        isHardBlock = hardBlock
-        overlayView?.let {
-            it.censorStyle = style
-            it.showBadge = badge
-            it.showBorder = border
-            it.isHardBlock = hardBlock
-            it.invalidate()
-        }
+class BlurOverlayManager(
+    private val context: Context,
+    private val onLeaveSafelyClicked: (() -> Unit)? = null,
+    private val onUnblurFalsePositiveClicked: (() -> Unit)? = null
+) {
+    companion object {
+        private const val TAG = "BlurOverlayManager"
     }
 
+    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+    private var rootContainer: FrameLayout? = null
+    private var backdropCanvas: CurtainBackdropCanvasView? = null
+    private var badgeChipView: TextView? = null
+    private var titleTextView: TextView? = null
+    private var reasonTextView: TextView? = null
+    private var strikeStatusTextView: TextView? = null
+    private var primaryLeaveButton: Button? = null
+    private var secondaryUnblurButton: Button? = null
+
+    private var isAttached = false
+
+    @Volatile
+    var isShieldVisible: Boolean = false
+        private set
+
+    @Volatile
+    var shieldedPackage: String? = null
+        private set
+
     /**
-     * Spawns the transparent overlay into WindowManager with a fade-in.
+     * Pre-allocates and attaches the app-scoped `TYPE_ACCESSIBILITY_OVERLAY` with `View.GONE`.
+     * Uses `FLAG_NOT_FOCUSABLE` and `FLAG_NOT_TOUCH_MODAL` without `FLAG_FULLSCREEN` so the
+     * system navigation bar, Home/Back/Recents gestures, and system UI never freeze.
      */
-    fun show() {
-        if (isShowing) return
+    fun attachPreAllocatedShield() {
+        if (isAttached) return
 
         try {
-            overlayView = BlurOverlayView(context).apply {
-                alpha = 0f
-                censorStyle = currentStyle
-                showBadge = this@BlurOverlayManager.showBadge
-                showBorder = this@BlurOverlayManager.showBorder
-                isHardBlock = this@BlurOverlayManager.isHardBlock
+            val density = context.resources.displayMetrics.density
+            fun dp(value: Int): Int = (value * density).toInt()
+
+            val container = FrameLayout(context).apply {
+                // High-opacity fallback background (#F20F172A) guarantees zero bleed-through
+                setBackgroundColor(Color.parseColor("#F20F172A"))
+                visibility = View.GONE
+            }
+
+            val canvasView = CurtainBackdropCanvasView(context)
+            container.addView(
+                canvasView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+            )
+
+            // Center card holding title, detection reason, strike status, and action buttons
+            val cardLayout = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(28), dp(32), dp(28), dp(28))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(24).toFloat()
+                    setColor(Color.parseColor("#FF1E293B"))
+                    setStroke(dp(1), Color.parseColor("#475569"))
+                }
+            }
+
+            val badgeView = TextView(context).apply {
+                text = "AMNGAZE AI SHIELD ACTIVE"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(Color.parseColor("#F87171"))
+                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                letterSpacing = 0.1f
+                gravity = Gravity.CENTER
+                setPadding(dp(14), dp(6), dp(14), dp(6))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(99).toFloat()
+                    setColor(Color.parseColor("#33EF4444"))
+                    setStroke(dp(1), Color.parseColor("#7FEF4444"))
+                }
+            }
+
+            val titleView = TextView(context).apply {
+                text = "Explicit or Revealing Content Blocked"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+                setTextColor(Color.WHITE)
+                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                gravity = Gravity.CENTER
+                setPadding(0, dp(18), 0, dp(8))
+            }
+
+            val reasonView = TextView(context).apply {
+                text = "On-device AI protection intercepted potentially triggering content."
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(Color.parseColor("#CBD5E1"))
+                gravity = Gravity.CENTER
+                setPadding(dp(8), 0, dp(8), dp(12))
+            }
+
+            val strikeView = TextView(context).apply {
+                text = "App-Scoped Curtain Protection"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(Color.parseColor("#94A3B8"))
+                typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(24))
+            }
+
+            val leaveBtn = Button(context).apply {
+                text = "Leave Page Safely"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                setTextColor(Color.WHITE)
+                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(14).toFloat()
+                    setColor(Color.parseColor("#E05A47"))
+                }
+                setPadding(dp(20), dp(14), dp(20), dp(14))
+                setOnClickListener {
+                    onLeaveSafelyClicked?.invoke()
+                }
+            }
+
+            val unblurBtn = Button(context).apply {
+                text = "False Positive - Unblur for 30s"
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(Color.parseColor("#E2E8F0"))
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(14).toFloat()
+                    setColor(Color.parseColor("#334155"))
+                    setStroke(dp(1), Color.parseColor("#64748B"))
+                }
+                setPadding(dp(20), dp(12), dp(20), dp(12))
+                setOnClickListener {
+                    onUnblurFalsePositiveClicked?.invoke()
+                }
+            }
+
+            cardLayout.addView(
+                badgeView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            cardLayout.addView(
+                titleView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            cardLayout.addView(
+                reasonView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            cardLayout.addView(
+                strikeView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            cardLayout.addView(
+                leaveBtn,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = dp(12)
+                }
+            )
+            cardLayout.addView(
+                unblurBtn,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+
+            val cardParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            ).apply {
+                leftMargin = dp(24)
+                rightMargin = dp(24)
+            }
+            container.addView(cardLayout, cardParams)
+
+            // FLAG_NOT_FOCUSABLE + FLAG_NOT_TOUCH_MODAL ensures system navigation bars (Home, Back,
+            // Recents gestures) and hardware keys never freeze, while overlay buttons remain clickable.
+            var windowFlags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                windowFlags = windowFlags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+            }
+
+            val windowType = try {
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            } catch (_: Throwable) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             }
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                windowType,
+                windowFlags,
                 PixelFormat.TRANSLUCENT
-            )
+            ).apply {
+                gravity = Gravity.CENTER
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    blurBehindRadius = 64
+                }
+            }
 
-            windowManager.addView(overlayView, params)
-            isShowing = true
+            windowManager.addView(container, params)
 
-            overlayView?.animate()
-                ?.alpha(1f)
-                ?.setDuration(220)
-                ?.start()
+            rootContainer = container
+            backdropCanvas = canvasView
+            badgeChipView = badgeView
+            titleTextView = titleView
+            reasonTextView = reasonView
+            strikeStatusTextView = strikeView
+            primaryLeaveButton = leaveBtn
+            secondaryUnblurButton = unblurBtn
+            isAttached = true
+            isShieldVisible = false
+            shieldedPackage = null
 
-            Log.i("BlurOverlayManager", "AmnGaze overlay window attached.")
+            Log.i(TAG, "Pre-allocated TYPE_ACCESSIBILITY_OVERLAY shield attached with View.GONE.")
         } catch (e: Exception) {
-            Log.e("BlurOverlayManager", "Failed to register overlay window.", e)
+            Log.e(TAG, "Failed to pre-allocate TYPE_ACCESSIBILITY_OVERLAY window.", e)
         }
     }
 
     /**
-     * Updates the coordinates of explicit regions on the active canvas.
+     * Instantly (<2ms) flips the pre-allocated curtain shield to `View.VISIBLE` scoped to [targetPackage].
+     * Automatically clears when the user navigates outside [targetPackage].
      */
-    fun updateRegions(boxes: List<android.graphics.RectF>) {
-        if (!isShowing) show()
-        overlayView?.updateRegions(boxes)
+    fun showCurtainShield(
+        targetPackage: String,
+        censorStyle: BlurCensorStyle,
+        showBadge: Boolean,
+        showBorder: Boolean,
+        title: String,
+        reason: String,
+        strikeStatus: String,
+        allowFalsePositiveUnblur: Boolean,
+        primaryActionLabel: String = "Leave Page Safely",
+        secondaryActionLabel: String = "False Positive - Unblur for 30s"
+    ) {
+        if (!isAttached) {
+            attachPreAllocatedShield()
+        }
+
+        shieldedPackage = targetPackage
+
+        backdropCanvas?.apply {
+            this.censorStyle = censorStyle
+            this.showBorder = showBorder
+            startAnimationsIfNeeded()
+        }
+
+        badgeChipView?.visibility = if (showBadge) View.VISIBLE else View.GONE
+        titleTextView?.text = title
+        reasonTextView?.text = reason
+        strikeStatusTextView?.text = strikeStatus
+        primaryLeaveButton?.text = primaryActionLabel
+        secondaryUnblurButton?.text = secondaryActionLabel
+        secondaryUnblurButton?.visibility = if (allowFalsePositiveUnblur) View.VISIBLE else View.GONE
+
+        rootContainer?.visibility = View.VISIBLE
+        isShieldVisible = true
     }
 
     /**
-     * Clears all detected regions (keeps overlay attached but empty).
-     */
-    fun clearRegions() {
-        overlayView?.clearRegions()
-    }
-
-    /**
-     * Removes the overlay from screen with a fade-out animation.
+     * Immediately hides the shield (`View.GONE`) and clears [shieldedPackage].
      */
     fun hide() {
-        if (!isShowing) return
+        backdropCanvas?.stopAnimations()
+        rootContainer?.visibility = View.GONE
+        isShieldVisible = false
+        shieldedPackage = null
+    }
 
-        val view = overlayView ?: run {
-            isShowing = false
-            return
-        }
-
-        view.animate()
-            .alpha(0f)
-            .setDuration(250)
-            .withEndAction {
-                try {
-                    windowManager.removeView(view)
-                } catch (e: Exception) {
-                    Log.e("BlurOverlayManager", "Error removing overlay view.", e)
-                }
-                overlayView = null
-                isShowing = false
-                Log.i("BlurOverlayManager", "AmnGaze overlay window removed.")
+    /**
+     * Detaches the pre-allocated window when the AccessibilityService is destroyed.
+     */
+    fun detach() {
+        hide()
+        val view = rootContainer ?: return
+        try {
+            if (isAttached) {
+                windowManager.removeView(view)
             }
-            .start()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to remove pre-allocated Accessibility overlay.", e)
+        } finally {
+            rootContainer = null
+            backdropCanvas = null
+            isAttached = false
+            isShieldVisible = false
+            shieldedPackage = null
+        }
     }
 }

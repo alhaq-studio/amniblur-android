@@ -1,39 +1,5 @@
 package com.amngaze
 
-import androidx.compose.animation.*
-import androidx.compose.animation.core.*
-import androidx.compose.foundation.*
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.viewmodel.compose.viewModel
-import com.amngaze.ui.theme.AmnGazeTheme
-import com.amngaze.ui.theme.*
-import com.amngaze.ui.components.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -41,12 +7,52 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
-import android.media.projection.MediaProjectionManager
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.EaseOutSine
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.delay
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.amngaze.ui.theme.AmnGazeTheme
+import com.amngaze.ui.theme.SunsetPrimary
+import androidx.compose.ui.window.DialogProperties
 
 enum class Screen {
     WELCOME,
@@ -61,50 +67,34 @@ fun AmnGazeApp(
 ) {
     val state by viewModel.state.collectAsState()
     var currentScreen by remember { mutableStateOf(Screen.WELCOME) }
-    var previousScreen by remember { mutableStateOf<Screen?>(null) }
+    var showDisclosureDialog by remember { mutableStateOf(false) }
+    var showRestrictedSettingsDialog by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
-    val isAmnGazeRunning by ProtectionOverlayService.isRunning.collectAsState()
-
-    val projectionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
-            val serviceIntent = Intent(context, ProtectionOverlayService::class.java).apply {
-                action = ProtectionOverlayService.ACTION_START
-                putExtra(ProtectionOverlayService.EXTRA_RESULT_CODE, result.resultCode)
-                putExtra(ProtectionOverlayService.EXTRA_DATA_INTENT, result.data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
-            }
-            Toast.makeText(context, "AmnGaze Active Protection: ON", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(context, "AmnGaze projection permission denied.", Toast.LENGTH_LONG).show()
-        }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val isServiceConnected by AmnGazeAccessibilityService.isRunning.collectAsState()
+    var isAccessibilityEnabled by remember {
+        mutableStateOf(AmnGazeAccessibilityService.isServiceEnabled(context))
     }
 
-    val toggleAmnGaze = {
-        if (isAmnGazeRunning) {
-            val serviceIntent = Intent(context, ProtectionOverlayService::class.java).apply {
-                action = ProtectionOverlayService.ACTION_STOP
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isAccessibilityEnabled = AmnGazeAccessibilityService.isServiceEnabled(context)
+                viewModel.refreshProtectionMetrics()
             }
-            context.stopService(serviceIntent)
-            Toast.makeText(context, "AmnGaze Active Protection: OFF", Toast.LENGTH_SHORT).show()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val isProtectionActive = isServiceConnected || isAccessibilityEnabled
+
+    val requestAccessibilitySetup = {
+        if (state.hasAcceptedAccessibilityDisclosure) {
+            openAccessibilitySettings(context)
         } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
-                Toast.makeText(context, "Overlay Window permission required for AmnGaze AI.", Toast.LENGTH_LONG).show()
-                val intent = Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:${context.packageName}")
-                )
-                context.startActivity(intent)
-            } else {
-                val mediaProjectionManager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                projectionLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
-            }
+            showDisclosureDialog = true
         }
     }
 
@@ -123,32 +113,212 @@ fun AmnGazeApp(
             when (currentScreen) {
                 Screen.WELCOME -> WelcomeScreen(
                     onGetStarted = {
-                        previousScreen = Screen.WELCOME
                         currentScreen = Screen.QUICK_SETUP
                     }
                 )
 
-                Screen.QUICK_SETUP -> QuickSetupScreen(
-                    state = state,
-                    onContinue = {
-                        viewModel.completeSetup()
-                        currentScreen = Screen.MAIN_DASHBOARD
-                    },
-                    onSkip = {
-                        viewModel.completeSetup()
-                        currentScreen = Screen.MAIN_DASHBOARD
+                Screen.QUICK_SETUP -> {
+                    BackHandler {
+                        currentScreen = Screen.WELCOME
                     }
-                )
+                    QuickSetupScreen(
+                        isAccessibilityEnabled = isProtectionActive,
+                        onOpenAccessibility = requestAccessibilitySetup,
+                        onOpenRestrictedSettingsHelp = { showRestrictedSettingsDialog = true },
+                        onContinue = {
+                            viewModel.completeSetup()
+                            currentScreen = Screen.MAIN_DASHBOARD
+                        },
+                        onSkip = {
+                            viewModel.completeSetup()
+                            currentScreen = Screen.MAIN_DASHBOARD
+                        }
+                    )
+                }
 
                 Screen.MAIN_DASHBOARD -> MainDashboardScreen(
                     state = state,
                     viewModel = viewModel,
-                    isAmnGazeRunning = isAmnGazeRunning,
-                    onToggleAmnGaze = toggleAmnGaze
+                    isAmnGazeRunning = isProtectionActive,
+                    onToggleAmnGaze = requestAccessibilitySetup,
+                    onOpenRestrictedSettingsHelp = { showRestrictedSettingsDialog = true }
+                )
+            }
+
+            if (showDisclosureDialog) {
+                ProminentDisclosureDialog(
+                    onAccept = {
+                        viewModel.acceptAccessibilityDisclosure()
+                        showDisclosureDialog = false
+                        openAccessibilitySettings(context)
+                    },
+                    onDecline = {
+                        showDisclosureDialog = false
+                    }
+                )
+            }
+
+            if (showRestrictedSettingsDialog) {
+                RestrictedSettingsHelperDialog(
+                    onOpenAppInfo = {
+                        showRestrictedSettingsDialog = false
+                        openAppDetailsSettings(context)
+                    },
+                    onDismiss = {
+                        showRestrictedSettingsDialog = false
+                    }
                 )
             }
         }
     }
+}
+
+/**
+ * Mandatory Google Play & Android Accessibility Prominent Disclosure Dialog.
+ * Non-cancelable outside explicit Accept/Decline actions.
+ */
+@Composable
+fun ProminentDisclosureDialog(
+    onAccept: () -> Unit,
+    onDecline: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = {},
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false
+        ),
+        icon = {
+            Icon(
+                imageVector = Icons.Default.VerifiedUser,
+                contentDescription = "Accessibility Disclosure",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(36.dp)
+            )
+        },
+        title = {
+            Text(
+                text = "Accessibility Service Disclosure",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    text = "AmnGaze uses the Android AccessibilityService API to provide real-time, on-device protection against explicit content:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = "1. Fast-Path URL & Text Inspection: Reads active browser URL bars and visible headers to intercept adult domains in under 10ms.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "2. On-Device LiteRT Vision Scanning: Captures periodic screen snapshots when scrolling settles in media apps to evaluate frames locally in RAM.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "3. Whole-Screen Curtain Shield: Displays an instant full-screen overlay or navigates back when explicit material is detected.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                ) {
+                    Text(
+                        text = "100% On-Device Privacy: All URL checks and AI vision inference run locally on your device. No screenshots, URLs, or personal data ever leave your device.",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onAccept,
+                modifier = Modifier.testTag("disclosure_accept_button")
+            ) {
+                Text("I Agree & Open Settings")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDecline,
+                modifier = Modifier.testTag("disclosure_decline_button")
+            ) {
+                Text("Not Now")
+            }
+        }
+    )
+}
+
+/**
+ * Helper dialog guiding users on Android 13+ (API 33+) how to unlock "Allow restricted settings"
+ * when the APK is installed directly outside Google Play.
+ */
+@Composable
+fun RestrictedSettingsHelperDialog(
+    onOpenAppInfo: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                imageVector = Icons.Default.LockOpen,
+                contentDescription = "Restricted Settings Guide",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(32.dp)
+            )
+        },
+        title = {
+            Text(
+                text = "Android 13+ Restricted Settings Guide",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "If Android greys out the AmnGaze Accessibility toggle with a \"Restricted setting\" notice, follow these 3 steps:",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    text = "Step 1: Tap \"Open App Info\" below to open AmnGaze system details.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "Step 2: Tap the 3-dot menu icon in the top-right corner of the App Info screen.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "Step 3: Select \"Allow restricted settings\" and authenticate with your PIN or biometric, then enable AmnGaze in Accessibility Settings.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = onOpenAppInfo) {
+                Text("Open App Info")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
 }
 
 @Composable
@@ -159,6 +329,7 @@ fun WelcomeScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
         Column(
             modifier = Modifier
@@ -167,7 +338,7 @@ fun WelcomeScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(24.dp))
 
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -196,7 +367,7 @@ fun WelcomeScreen(
                 Spacer(modifier = Modifier.height(32.dp))
 
                 Text(
-                    text = "Welcome to AmnGaze AI Blur",
+                    text = "Welcome to AmnGaze AI Shield",
                     style = MaterialTheme.typography.headlineLarge,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground,
@@ -206,11 +377,11 @@ fun WelcomeScreen(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
-                    text = "Your intelligent companion featuring low-latency, on-device explicit image blurring and Content Protection.",
+                    text = "3-Layer Accessibility Content Blocker & Full-Screen Curtain Shield powered by 100% on-device LiteRT AI.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = 24.dp)
+                    modifier = Modifier.padding(horizontal = 16.dp)
                 )
             }
 
@@ -218,7 +389,8 @@ fun WelcomeScreen(
                 onClick = onGetStarted,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp),
+                    .height(56.dp)
+                    .testTag("get_started_button"),
                 shape = RoundedCornerShape(28.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
@@ -231,7 +403,7 @@ fun WelcomeScreen(
                 ) {
                     Text("Get Started", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Icon(imageVector = Icons.Default.ArrowForward, contentDescription = null)
+                    Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null)
                 }
             }
         }
@@ -240,7 +412,9 @@ fun WelcomeScreen(
 
 @Composable
 fun QuickSetupScreen(
-    state: AmnGazeState,
+    isAccessibilityEnabled: Boolean,
+    onOpenAccessibility: () -> Unit,
+    onOpenRestrictedSettingsHelp: () -> Unit,
     onContinue: () -> Unit,
     onSkip: () -> Unit
 ) {
@@ -249,12 +423,6 @@ fun QuickSetupScreen(
 
     var batteryGranted by remember { mutableStateOf(isBatteryOptimizationIgnored(context)) }
     var notificationsGranted by remember { mutableStateOf(isNotificationPermissionGranted(context)) }
-    var overlayGranted by remember {
-        mutableStateOf(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(context)
-            else true
-        )
-    }
 
     val notifLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -265,21 +433,18 @@ fun QuickSetupScreen(
             if (event == Lifecycle.Event.ON_RESUME) {
                 batteryGranted = isBatteryOptimizationIgnored(context)
                 notificationsGranted = isNotificationPermissionGranted(context)
-                overlayGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                    Settings.canDrawOverlays(context) else true
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val canProceed = overlayGranted
-
     Scaffold(
         topBar = {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.statusBars)
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -307,7 +472,7 @@ fun QuickSetupScreen(
                 .padding(horizontal = 24.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Text(
                     text = "Quick Setup",
                     style = MaterialTheme.typography.headlineLarge,
@@ -315,15 +480,11 @@ fun QuickSetupScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
 
-                Spacer(modifier = Modifier.height(12.dp))
-
                 Text(
-                    text = "We need Draw Over Other Apps permission to place the censoring overlay over explicit content.",
+                    text = "Enable the AmnGaze Accessibility Shield for zero-flicker whole-screen curtain protection and instant URL interception.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-
-                Spacer(modifier = Modifier.height(28.dp))
 
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -334,23 +495,14 @@ fun QuickSetupScreen(
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                 ) {
                     Column {
-                        // 1. Draw Over Other Apps
+                        // 1. Accessibility Shield Service
                         PermissionRow(
-                            icon = Icons.Default.Layers,
-                            title = "Draw Over Other Apps",
-                            description = "Required for AI blur overlay",
+                            icon = Icons.Default.AccessibilityNew,
+                            title = "Accessibility Shield Service",
+                            description = "Required for <2ms curtain shield & local AI scan",
                             isRequired = true,
-                            isDone = overlayGranted,
-                            onClick = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                    context.startActivity(
-                                        Intent(
-                                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                            Uri.parse("package:${context.packageName}")
-                                        ).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
-                                    )
-                                }
-                            }
+                            isDone = isAccessibilityEnabled,
+                            onClick = onOpenAccessibility
                         )
 
                         HorizontalDivider(
@@ -361,8 +513,8 @@ fun QuickSetupScreen(
                         // 2. Battery Optimization
                         PermissionRow(
                             icon = Icons.Default.BatteryFull,
-                            title = "Battery Optimization",
-                            description = "Keeps shields active in background",
+                            title = "Battery Optimization Exemption",
+                            description = "Keeps Accessibility protection responsive in background",
                             isRequired = false,
                             isDone = batteryGranted,
                             onClick = {
@@ -374,7 +526,7 @@ fun QuickSetupScreen(
                                                 Uri.parse("package:${context.packageName}")
                                             ).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
                                         )
-                                    } catch (e: Exception) {
+                                    } catch (_: Exception) {
                                         context.startActivity(
                                             Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS).apply {
                                                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -393,8 +545,8 @@ fun QuickSetupScreen(
                         // 3. Notifications
                         PermissionRow(
                             icon = Icons.Default.Notifications,
-                            title = "Notifications Alerts",
-                            description = "Required for active protection status indicator",
+                            title = "Protection Status Alerts",
+                            description = "Optional alerts for cooldown lockouts",
                             isRequired = false,
                             isDone = notificationsGranted,
                             onClick = {
@@ -412,6 +564,43 @@ fun QuickSetupScreen(
                         )
                     }
                 }
+
+                // Android 13+ Restricted Settings Helper Card
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onOpenRestrictedSettingsHelp() }
+                        .testTag("restricted_settings_help_card"),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.HelpOutline,
+                            contentDescription = "Restricted Settings Help",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Android 13+ \"Restricted Setting\" Greyed Out?",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Tap here for the 3-step guide to enable Allow Restricted Settings in App Info.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             }
 
             Column(
@@ -419,7 +608,7 @@ fun QuickSetupScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                AnimatedVisibility(visible = !overlayGranted) {
+                AnimatedVisibility(visible = !isAccessibilityEnabled) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
@@ -438,7 +627,7 @@ fun QuickSetupScreen(
                                 modifier = Modifier.size(16.dp)
                             )
                             Text(
-                                text = "Please enable \"Draw Over Other Apps\" to allow blurring content.",
+                                text = "Tap \"Accessibility Shield Service\" above to review the disclosure and activate protection.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onErrorContainer
                             )
@@ -448,27 +637,30 @@ fun QuickSetupScreen(
 
                 Button(
                     onClick = onContinue,
-                    enabled = canProceed,
+                    enabled = isAccessibilityEnabled,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp),
+                        .height(56.dp)
+                        .testTag("setup_continue_button"),
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (canProceed) MaterialTheme.colorScheme.primary
-                                         else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
-                        contentColor = if (canProceed) MaterialTheme.colorScheme.onPrimary
-                                       else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                        containerColor = if (isAccessibilityEnabled) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                        contentColor = if (isAccessibilityEnabled) MaterialTheme.colorScheme.onPrimary
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                     )
                 ) {
-                    Text("Continue", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Continue to Dashboard", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 }
 
                 TextButton(
                     onClick = onSkip,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("setup_skip_button")
                 ) {
                     Text(
-                        "Skip for now",
+                        "Configure Dashboard First",
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
@@ -512,7 +704,7 @@ fun PermissionRow(
                     imageVector = if (isDone) Icons.Default.Check else icon,
                     contentDescription = null,
                     tint = if (isDone) MaterialTheme.colorScheme.primary
-                           else MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurface
                 )
             }
 
@@ -545,7 +737,7 @@ fun PermissionRow(
                 else -> MaterialTheme.colorScheme.surface
             },
             border = if (isDone || isRequired) null
-                     else BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            else BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
@@ -562,7 +754,7 @@ fun PermissionRow(
                 }
                 Text(
                     text = when {
-                        isDone -> "Done"
+                        isDone -> "Active"
                         isRequired -> "Required"
                         else -> "Optional"
                     },
@@ -584,7 +776,8 @@ fun MainDashboardScreen(
     state: AmnGazeState,
     viewModel: AmnGazeViewModel,
     isAmnGazeRunning: Boolean,
-    onToggleAmnGaze: () -> Unit
+    onToggleAmnGaze: () -> Unit,
+    onOpenRestrictedSettingsHelp: () -> Unit
 ) {
     var showThemeMenu by remember { mutableStateOf(false) }
 
@@ -603,7 +796,7 @@ fun MainDashboardScreen(
                             modifier = Modifier.size(24.dp)
                         )
                         Text(
-                            text = "AmnGaze AI Blur",
+                            text = "AmnGaze AI Shield",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
@@ -611,8 +804,18 @@ fun MainDashboardScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenRestrictedSettingsHelp) {
+                        Icon(
+                            imageVector = Icons.Default.HelpOutline,
+                            contentDescription = "Restricted Settings Guide",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     Box {
-                        IconButton(onClick = { showThemeMenu = true }) {
+                        IconButton(
+                            onClick = { showThemeMenu = true },
+                            modifier = Modifier.testTag("theme_menu_button")
+                        ) {
                             Icon(
                                 imageVector = Icons.Default.Palette,
                                 contentDescription = "Switch Theme",
@@ -653,10 +856,12 @@ fun MainDashboardScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
-                .padding(horizontal = 24.dp),
+                .padding(horizontal = 24.dp)
+                .testTag("dashboard_lazy_column"),
             verticalArrangement = Arrangement.spacedBy(20.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 40.dp)
         ) {
+            // 1. Primary Accessibility Shield Status Card
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -729,29 +934,33 @@ fun MainDashboardScreen(
                             ) {
                                 Icon(
                                     imageVector = if (isAmnGazeRunning) Icons.Default.Shield else Icons.Default.PrivacyTip,
-                                    contentDescription = "Toggle",
-                                    tint = if (isAmnGazeRunning) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    contentDescription = "Toggle Accessibility Protection",
+                                    tint = if (isAmnGazeRunning) MaterialTheme.colorScheme.onPrimary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(32.dp)
                                 )
                             }
                         }
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
                         Text(
-                            text = if (isAmnGazeRunning) "AI Blur Active" else "AI Protection Paused",
+                            text = if (isAmnGazeRunning) "3-Layer Accessibility Shield Active" else "Accessibility Shield Inactive",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = if (isAmnGazeRunning) "On-device AI content blurring is active."
-                                   else "Tap the shield button to start real-time image censorship.",
+                            text = if (isAmnGazeRunning) {
+                                "Fast-path URL filtering, scroll-debounced LiteRT vision, and <2ms full-screen curtain shield are active."
+                            } else {
+                                "Enable AmnGaze in Android Accessibility Settings to activate zero-flicker protection."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(horizontal = 16.dp)
+                            modifier = Modifier.padding(horizontal = 12.dp)
                         )
 
                         Spacer(modifier = Modifier.height(16.dp))
@@ -760,20 +969,20 @@ fun MainDashboardScreen(
                             onClick = onToggleAmnGaze,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(48.dp),
+                                .height(48.dp)
+                                .testTag("toggle_protection_button"),
                             shape = RoundedCornerShape(14.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isAmnGazeRunning) MaterialTheme.colorScheme.error
-                                                 else MaterialTheme.colorScheme.primary
+                                containerColor = MaterialTheme.colorScheme.primary
                             )
                         ) {
                             Icon(
-                                imageVector = if (isAmnGazeRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
+                                imageVector = if (isAmnGazeRunning) Icons.Default.SettingsAccessibility else Icons.Default.PlayArrow,
                                 contentDescription = null
                             )
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                if (isAmnGazeRunning) "STOP PROTECTION" else "START PROTECTION",
+                                if (isAmnGazeRunning) "MANAGE ACCESSIBILITY SHIELD" else "ENABLE ACCESSIBILITY SHIELD",
                                 fontWeight = FontWeight.Bold
                             )
                         }
@@ -781,100 +990,102 @@ fun MainDashboardScreen(
                 }
             }
 
+            // 2. Whole-Screen Curtain & Enforcement Live Preview Card
             item {
+                val backdropColor = when (state.amnGazeCensorStyle) {
+                    BlurCensorStyle.FROSTED -> Color(0xFF1E293B)
+                    BlurCensorStyle.MOSAIC -> Color(0xFF172554)
+                    BlurCensorStyle.BLACK_BAR -> Color(0xFF070B14)
+                    BlurCensorStyle.GAUSSIAN_BLUR -> Color(0xFF0F172A)
+                }
+
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(160.dp),
+                        .height(176.dp),
                     shape = RoundedCornerShape(24.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Color(0xFF0A0A1E)
+                    colors = CardDefaults.cardColors(containerColor = backdropColor),
+                    border = BorderStroke(
+                        width = if (state.amnGazeShowBorder) 2.dp else 1.dp,
+                        color = if (state.amnGazeShowBorder) Color(0xFFEF4444) else Color(0xFF334155)
                     )
                 ) {
-                    Box(modifier = Modifier.fillMaxSize()) {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            Box(
-                                Modifier
-                                    .align(Alignment.TopCenter)
-                                    .padding(top = 10.dp)
-                                    .size(30.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFF3A3A5C))
-                            )
-                            Box(
-                                Modifier
-                                    .align(Alignment.Center)
-                                    .width(50.dp)
-                                    .height(60.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF2E2E4A))
-                            )
-                        }
-
-                        val previewBoxes = when (state.amnGazeBlurMode) {
-                            BlurTargetMode.FULL_SCREEN -> listOf(
-                                (0.02f to 0.02f) to (0.98f to 0.98f)
-                            )
-                            BlurTargetMode.FULL_PERSON -> listOf(
-                                (0.25f to 0.06f) to (0.75f to 0.96f)
-                            )
-                            BlurTargetMode.BODY_REGION -> listOf(
-                                (0.32f to 0.14f) to (0.68f to 0.30f),
-                                (0.16f to 0.12f) to (0.31f to 0.50f),
-                                (0.69f to 0.12f) to (0.84f to 0.50f),
-                                (0.27f to 0.30f) to (0.73f to 0.60f),
-                                (0.25f to 0.60f) to (0.75f to 0.84f)
-                            )
-                        }
-
-                        previewBoxes.forEach { (tl, br) ->
-                            val (left, top) = tl
-                            val (right, bottom) = br
-                            val censorColor = when (state.amnGazeCensorStyle) {
-                                BlurCensorStyle.MOSAIC -> Color(0xFF1A1A2E)
-                                BlurCensorStyle.GAUSSIAN_BLUR -> Color(0xFF1A1A2E).copy(alpha = 0.6f)
-                                BlurCensorStyle.BLACK_BAR -> Color.Black.copy(alpha = 0.85f)
-                                BlurCensorStyle.FROSTED -> Color.White.copy(alpha = 0.8f)
-                            }
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(
-                                        start = (left * 100).toInt().coerceIn(0, 98).dp,
-                                        top = (top * 100).toInt().coerceIn(0, 98).dp,
-                                        end = ((1f - right) * 100).toInt().coerceIn(0, 98).dp,
-                                        bottom = ((1f - bottom) * 100).toInt().coerceIn(0, 98).dp
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(16.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            if (state.amnGazeShowBadge) {
+                                Surface(
+                                    shape = RoundedCornerShape(99.dp),
+                                    color = Color(0x33EF4444),
+                                    border = BorderStroke(1.dp, Color(0x88EF4444))
+                                ) {
+                                    Text(
+                                        text = "AMNGAZE AI SHIELD ACTIVE",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFFF87171),
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
                                     )
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(censorColor)
+                                }
+                            }
+
+                            Text(
+                                text = when (state.enforcementMode) {
+                                    EnforcementMode.CURTAIN_SHIELD -> "Full-Screen Curtain Shield (<2ms)"
+                                    EnforcementMode.HARD_EJECT -> "Bulldog Hard Eject + 3-Strike Lockout"
+                                },
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+
+                            Text(
+                                text = when (state.enforcementMode) {
+                                    EnforcementMode.CURTAIN_SHIELD ->
+                                        "Covers entire screen (#F20F172A + Blur) with Leave Safely & 30s Unblur actions"
+                                    EnforcementMode.HARD_EJECT ->
+                                        "Strikes 1-2: Auto-Back | Strike 3 (within 5m): 15-Minute App Cooldown Lockout"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFCBD5E1),
+                                textAlign = TextAlign.Center
                             )
                         }
 
                         Box(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
-                                .padding(bottom = 8.dp)
                                 .clip(RoundedCornerShape(16.dp))
-                                .background(Color.Black.copy(alpha = 0.6f))
+                                .background(Color.Black.copy(alpha = 0.55f))
                                 .padding(horizontal = 12.dp, vertical = 4.dp)
                         ) {
+                            val styleName = when (state.amnGazeCensorStyle) {
+                                BlurCensorStyle.FROSTED -> "Frosted Glass"
+                                BlurCensorStyle.MOSAIC -> "Mosaic Curtain"
+                                BlurCensorStyle.BLACK_BAR -> "Blackout Shield"
+                                BlurCensorStyle.GAUSSIAN_BLUR -> "Alert Pulse"
+                            }
                             Text(
-                                "Live Preview — ${when (state.amnGazeBlurMode) {
-                                    BlurTargetMode.BODY_REGION -> "Body Region Mode"
-                                    BlurTargetMode.FULL_PERSON -> "Full Person Mode"
-                                    BlurTargetMode.FULL_SCREEN -> "Full Screen Mode"
-                                }}",
+                                text = "Whole-Screen Preview - $styleName",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = Color.White.copy(alpha = 0.8f)
+                                color = Color.White.copy(alpha = 0.85f)
                             )
                         }
                     }
                 }
             }
 
+            // 3. Enforcement Mode Selector (Curtain Shield vs. Bulldog Hard Eject)
             item {
                 Text(
-                    "DETECTION TARGET",
+                    "ENFORCEMENT MODE",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
@@ -891,40 +1102,37 @@ fun MainDashboardScreen(
                     )
                 ) {
                     Column {
-                        BlurTargetMode.entries.forEachIndexed { index, mode ->
+                        EnforcementMode.entries.forEachIndexed { index, mode ->
                             val (title, description, icon) = when (mode) {
-                                BlurTargetMode.BODY_REGION -> Triple(
-                                    "Body Region (Recommended)",
-                                    "Blurs individual exposed skin patches",
-                                    Icons.Default.CropFree
+                                EnforcementMode.CURTAIN_SHIELD -> Triple(
+                                    "Curtain Shield Mode (Recommended)",
+                                    "Instant <2ms full-screen shield with 'Leave Safely' and 'False Positive - Unblur for 30s'. Eliminates self-occlusion flicker.",
+                                    Icons.Default.VisibilityOff
                                 )
-                                BlurTargetMode.FULL_PERSON -> Triple(
-                                    "Full Person Silhouette",
-                                    "Blurs the entire person silhouette when detected",
-                                    Icons.Default.Person
-                                )
-                                BlurTargetMode.FULL_SCREEN -> Triple(
-                                    "Entire Screen",
-                                    "Pixelates the full screen when explicit content is found",
-                                    Icons.Default.Fullscreen
+                                EnforcementMode.HARD_EJECT -> Triple(
+                                    "Bulldog Hard Eject + 3-Strike Lockout",
+                                    "Immediately navigates back on Strikes 1-2, and locks the offending app for 15 minutes on Strike 3 within 5 minutes.",
+                                    Icons.Default.GppBad
                                 )
                             }
 
+                            val isSelected = state.enforcementMode == mode
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { viewModel.updateBlurMode(mode) }
+                                    .clickable { viewModel.updateEnforcementMode(mode) }
                                     .background(
-                                        if (state.amnGazeBlurMode == mode)
+                                        if (isSelected)
                                             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
                                         else Color.Transparent
                                     )
-                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                                    .testTag("enforcement_mode_${mode.name}"),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 RadioButton(
-                                    selected = state.amnGazeBlurMode == mode,
-                                    onClick = { viewModel.updateBlurMode(mode) },
+                                    selected = isSelected,
+                                    onClick = { viewModel.updateEnforcementMode(mode) },
                                     colors = RadioButtonDefaults.colors(
                                         selectedColor = MaterialTheme.colorScheme.primary
                                     )
@@ -933,8 +1141,7 @@ fun MainDashboardScreen(
                                 Icon(
                                     imageVector = icon,
                                     contentDescription = null,
-                                    tint = if (state.amnGazeBlurMode == mode)
-                                        MaterialTheme.colorScheme.primary
+                                    tint = if (isSelected) MaterialTheme.colorScheme.primary
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(20.dp)
                                 )
@@ -944,8 +1151,7 @@ fun MainDashboardScreen(
                                         title,
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = FontWeight.Bold,
-                                        color = if (state.amnGazeBlurMode == mode)
-                                            MaterialTheme.colorScheme.primary
+                                        color = if (isSelected) MaterialTheme.colorScheme.primary
                                         else MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
@@ -955,7 +1161,7 @@ fun MainDashboardScreen(
                                     )
                                 }
                             }
-                            if (index < BlurTargetMode.entries.size - 1) {
+                            if (index < EnforcementMode.entries.size - 1) {
                                 HorizontalDivider(
                                     modifier = Modifier.padding(horizontal = 16.dp),
                                     color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
@@ -966,9 +1172,10 @@ fun MainDashboardScreen(
                 }
             }
 
+            // 4. Curtain Censor Style Selector
             item {
                 Text(
-                    "CENSOR STYLE",
+                    "CURTAIN CENSOR STYLE",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
@@ -983,10 +1190,10 @@ fun MainDashboardScreen(
                 ) {
                     BlurCensorStyle.entries.forEach { style ->
                         val (label, icon) = when (style) {
-                            BlurCensorStyle.MOSAIC -> "Mosaic" to Icons.Default.Grid4x4
-                            BlurCensorStyle.GAUSSIAN_BLUR -> "Soft Blur" to Icons.Default.BlurOn
-                            BlurCensorStyle.BLACK_BAR -> "Black Bar" to Icons.Default.HideImage
                             BlurCensorStyle.FROSTED -> "Frosted" to Icons.Default.AcUnit
+                            BlurCensorStyle.MOSAIC -> "Mosaic" to Icons.Default.Grid4x4
+                            BlurCensorStyle.BLACK_BAR -> "Blackout" to Icons.Default.HideImage
+                            BlurCensorStyle.GAUSSIAN_BLUR -> "Alert Pulse" to Icons.Default.BlurOn
                         }
                         val isSelected = state.amnGazeCensorStyle == style
                         Column(
@@ -1003,14 +1210,15 @@ fun MainDashboardScreen(
                                     shape = RoundedCornerShape(16.dp)
                                 )
                                 .clickable { viewModel.updateCensorStyle(style) }
-                                .padding(vertical = 14.dp),
+                                .padding(vertical = 14.dp)
+                                .testTag("censor_style_${style.name}"),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Icon(
                                 imageVector = icon,
                                 contentDescription = label,
                                 tint = if (isSelected) MaterialTheme.colorScheme.primary
-                                       else MaterialTheme.colorScheme.onSurfaceVariant,
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(22.dp)
                             )
                             Spacer(Modifier.height(6.dp))
@@ -1019,7 +1227,7 @@ fun MainDashboardScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                                 color = if (isSelected) MaterialTheme.colorScheme.primary
-                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center
                             )
                         }
@@ -1027,6 +1235,7 @@ fun MainDashboardScreen(
                 }
             }
 
+            // 5. Detection Sensitivity Slider
             item {
                 Text(
                     "DETECTION SENSITIVITY",
@@ -1052,7 +1261,7 @@ fun MainDashboardScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                "Confidence Threshold",
+                                "AI Sensitivity",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
@@ -1086,12 +1295,12 @@ fun MainDashboardScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                "Permissive (more detections)",
+                                "Strict (fewer false positives)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                "Strict (fewer, precise)",
+                                "Aggressive (higher sensitivity)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1100,9 +1309,10 @@ fun MainDashboardScreen(
                 }
             }
 
+            // 6. 3-Layer Defense & Visual Options
             item {
                 Text(
-                    "VISUAL OPTIONS",
+                    "3-LAYER DEFENSE & SHIELD OPTIONS",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
@@ -1120,8 +1330,28 @@ fun MainDashboardScreen(
                 ) {
                     Column {
                         SettingsToggleRow(
+                            icon = Icons.Default.Language,
+                            title = "Layer 1: Fast-Path URL & 80k Domain Filter",
+                            checked = state.urlFastPathEnabled,
+                            onCheckedChange = { viewModel.toggleUrlFastPath() }
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                        )
+                        SettingsToggleRow(
+                            icon = Icons.Default.VpnLock,
+                            title = "Block Incognito / Secure Windows",
+                            checked = state.blockIncognitoEnabled,
+                            onCheckedChange = { viewModel.toggleBlockIncognito() }
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                        )
+                        SettingsToggleRow(
                             icon = Icons.Default.Badge,
-                            title = "Show Alert Badge",
+                            title = "Show Curtain Shield Badge",
                             checked = state.amnGazeShowBadge,
                             onCheckedChange = { viewModel.toggleBlurBadge() }
                         )
@@ -1131,27 +1361,18 @@ fun MainDashboardScreen(
                         )
                         SettingsToggleRow(
                             icon = Icons.Default.BorderStyle,
-                            title = "Animated Alert Border",
+                            title = "Animated Alert Border & Scanline",
                             checked = state.amnGazeShowBorder,
                             onCheckedChange = { viewModel.toggleBlurBorder() }
-                        )
-                        HorizontalDivider(
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                        )
-                        SettingsToggleRow(
-                            icon = Icons.Default.ColorLens,
-                            title = "Skin-Tone Heuristic",
-                            checked = state.amnGazeSkinHeuristic,
-                            onCheckedChange = { viewModel.toggleSkinHeuristic() }
                         )
                     }
                 }
             }
 
+            // 7. On-Device LiteRT Moderation Model Selector
             item {
                 Text(
-                    "MODERATION MODEL",
+                    "ON-DEVICE LITERT MODEL",
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
@@ -1172,35 +1393,37 @@ fun MainDashboardScreen(
                             val (title, description, icon) = when (modelType) {
                                 ModerationModelType.DEFAULT_NSFW -> Triple(
                                     "Default NSFW Filter",
-                                    "Standard open_nsfw model (Yahoo MobileNet V2)",
+                                    "Standard MobileNet V2 NSFW model (amn_gaze.tflite)",
                                     Icons.Default.Security
                                 )
                                 ModerationModelType.QUANTIZED_NSFW -> Triple(
                                     "Quantized NSFW Filter",
-                                    "Fast, low-memory quantized model (MobileNet V2 1.4)",
+                                    "Fast INT8/UINT8 quantized model (nsfw_mobilenet_v2_140_224_quantized.tflite)",
                                     Icons.Default.Speed
                                 )
                                 ModerationModelType.GENDER_FILTER -> Triple(
-                                    "Gender Filter",
-                                    "Gender estimation model (Female content filter)",
+                                    "Gender / Revealing Filter",
+                                    "Compact gender classification model (model_lite_gender_q.tflite)",
                                     Icons.Default.Face
                                 )
                             }
 
+                            val isSelected = state.amnGazeModelType == modelType
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable { viewModel.updateModelType(modelType) }
                                     .background(
-                                        if (state.amnGazeModelType == modelType)
+                                        if (isSelected)
                                             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
                                         else Color.Transparent
                                     )
-                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                                    .testTag("model_type_${modelType.name}"),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 RadioButton(
-                                    selected = state.amnGazeModelType == modelType,
+                                    selected = isSelected,
                                     onClick = { viewModel.updateModelType(modelType) },
                                     colors = RadioButtonDefaults.colors(
                                         selectedColor = MaterialTheme.colorScheme.primary
@@ -1210,8 +1433,7 @@ fun MainDashboardScreen(
                                 Icon(
                                     imageVector = icon,
                                     contentDescription = null,
-                                    tint = if (state.amnGazeModelType == modelType)
-                                        MaterialTheme.colorScheme.primary
+                                    tint = if (isSelected) MaterialTheme.colorScheme.primary
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(20.dp)
                                 )
@@ -1221,8 +1443,7 @@ fun MainDashboardScreen(
                                         title,
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = FontWeight.Bold,
-                                        color = if (state.amnGazeModelType == modelType)
-                                            MaterialTheme.colorScheme.primary
+                                        color = if (isSelected) MaterialTheme.colorScheme.primary
                                         else MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
@@ -1243,16 +1464,7 @@ fun MainDashboardScreen(
                 }
             }
 
-            item {
-                Text(
-                    "HARD BLOCK MODE",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    letterSpacing = 0.08.sp
-                )
-            }
-
+            // 8. Strike & Lockout Status Card
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1261,56 +1473,39 @@ fun MainDashboardScreen(
                         containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
                     )
                 ) {
-                    Column {
-                        SettingsToggleRow(
-                            icon = Icons.Default.Block,
-                            title = "Redirect to Home Screen",
-                            checked = state.amnGazeHardBlockEnabled,
-                            onCheckedChange = { viewModel.toggleHardBlock(it) }
-                        )
-
-                        if (state.amnGazeHardBlockEnabled) {
-                            HorizontalDivider(
-                                modifier = Modifier.padding(horizontal = 16.dp),
-                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Cooldown Lockouts & Detections",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
                             )
-                            Column(modifier = Modifier.padding(16.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        "Severity Threshold",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        "${(state.amnGazeHardBlockThreshold * 100).toInt()}%",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                                Spacer(Modifier.height(8.dp))
-                                Text(
-                                    "When the AI is this confident, the screen will instantly go black and you will be redirected to the home screen.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Spacer(Modifier.height(8.dp))
-                                androidx.compose.material3.Slider(
-                                    value = state.amnGazeHardBlockThreshold,
-                                    onValueChange = { viewModel.updateHardBlockThreshold(it) },
-                                    valueRange = 0.5f..0.95f,
-                                    steps = 8
-                                )
+                            Text(
+                                text = "Locked Apps: ${state.activeLockedPackageCount} | Total Blocks: ${state.totalDetectionsCount}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (state.activeLockedPackageCount > 0) {
+                            OutlinedButton(
+                                onClick = { viewModel.clearAllLockouts() },
+                                modifier = Modifier.testTag("clear_lockouts_button")
+                            ) {
+                                Text("Reset Lockouts")
                             }
                         }
                     }
                 }
             }
 
+            // 9. Privacy & Architecture Summary Footer
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1336,8 +1531,9 @@ fun MainDashboardScreen(
                             ModerationModelType.GENDER_FILTER -> "Gender Filter (model_lite_gender_q.tflite)"
                         }
                         Text(
-                            "AmnGaze AI Blur runs entirely on-device with zero cloud upload. " +
-                            "Active Model: $modelLabel.",
+                            "AmnGaze runs 100% locally in RAM with zero cloud uploads. " +
+                                "Scroll-settled screenshots (180ms settle / 750ms ceiling) and HardwareBuffers are recycled immediately after inference. " +
+                                "Active Model: $modelLabel.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1403,6 +1599,29 @@ fun SettingsToggleRow(
     }
 }
 
+fun openAccessibilitySettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        Toast.makeText(context, "Unable to open Accessibility Settings.", Toast.LENGTH_SHORT).show()
+    }
+}
+
+fun openAppDetailsSettings(context: Context) {
+    try {
+        val intent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:${context.packageName}")
+        ).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+    }
+}
 
 fun isBatteryOptimizationIgnored(context: Context): Boolean {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1414,9 +1633,8 @@ fun isBatteryOptimizationIgnored(context: Context): Boolean {
 fun isNotificationPermissionGranted(context: Context): Boolean {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         ContextCompat.checkSelfPermission(
-            context, android.Manifest.permission.POST_NOTIFICATIONS
+            context,
+            android.Manifest.permission.POST_NOTIFICATIONS
         ) == PackageManager.PERMISSION_GRANTED
     } else true
 }
-
-

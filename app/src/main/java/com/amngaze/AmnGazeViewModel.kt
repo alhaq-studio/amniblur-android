@@ -2,6 +2,7 @@ package com.amngaze
 
 import android.app.Application
 import android.content.Context
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -10,32 +11,47 @@ import kotlinx.coroutines.flow.update
 
 class AmnGazeViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val strikeLockoutManager = StrikeLockoutManager(prefs)
 
-    private val _state = MutableStateFlow(
-        AmnGazeState(
+    private val _state = MutableStateFlow(loadInitialState())
+    val state: StateFlow<AmnGazeState> = _state.asStateFlow()
+
+    private fun loadInitialState(): AmnGazeState {
+        val now = SystemClock.elapsedRealtime()
+        val lockedCount = strikeLockoutManager.getActiveLockedPackages(now).size
+        return AmnGazeState(
             isSetupComplete = prefs.getBoolean(PREFS_KEY_SETUP_COMPLETE, false),
-            // AmnGaze Blur config
+            hasAcceptedAccessibilityDisclosure = prefs.getBoolean(PREFS_KEY_DISCLOSURE_ACCEPTED, false),
+            currentTheme = AppTheme.entries.getOrElse(
+                prefs.getInt(PREFS_KEY_APP_THEME, AppTheme.SUNSET_GLOW.ordinal)
+            ) { AppTheme.SUNSET_GLOW },
+            enforcementMode = EnforcementMode.entries.getOrElse(
+                prefs.getInt(PREFS_KEY_ENFORCEMENT_MODE, EnforcementMode.CURTAIN_SHIELD.ordinal)
+            ) { EnforcementMode.CURTAIN_SHIELD },
             amnGazeBlurMode = BlurTargetMode.entries.getOrElse(
-                prefs.getInt(PREFS_KEY_BLUR_TARGET_MODE, BlurTargetMode.BODY_REGION.ordinal)
-            ) { BlurTargetMode.BODY_REGION },
+                prefs.getInt(PREFS_KEY_BLUR_TARGET_MODE, BlurTargetMode.FULL_SCREEN.ordinal)
+            ) { BlurTargetMode.FULL_SCREEN },
             amnGazeCensorStyle = BlurCensorStyle.entries.getOrElse(
-                prefs.getInt(PREFS_KEY_BLUR_CENSOR_STYLE, BlurCensorStyle.MOSAIC.ordinal)
-            ) { BlurCensorStyle.MOSAIC },
+                prefs.getInt(PREFS_KEY_BLUR_CENSOR_STYLE, BlurCensorStyle.FROSTED.ordinal)
+            ) { BlurCensorStyle.FROSTED },
             amnGazeBlurSensitivity = prefs.getFloat(PREFS_KEY_BLUR_SENSITIVITY, 0.5f),
             amnGazeShowBadge = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BADGE, true),
             amnGazeShowBorder = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BORDER, true),
-            amnGazeSkinHeuristic = prefs.getBoolean(PREFS_KEY_BLUR_SKIN_HEURISTIC, true),
             amnGazeModelType = ModerationModelType.entries.getOrElse(
                 prefs.getInt(PREFS_KEY_MODEL_TYPE, ModerationModelType.DEFAULT_NSFW.ordinal)
             ) { ModerationModelType.DEFAULT_NSFW },
             amnGazeHardBlockEnabled = prefs.getBoolean(PREFS_KEY_HARD_BLOCK_ENABLED, false),
-            amnGazeHardBlockThreshold = prefs.getFloat(PREFS_KEY_HARD_BLOCK_THRESHOLD, 0.85f)
+            amnGazeHardBlockThreshold = prefs.getFloat(PREFS_KEY_HARD_BLOCK_THRESHOLD, 0.85f),
+            blockIncognitoEnabled = prefs.getBoolean(PREFS_KEY_BLOCK_INCOGNITO, true),
+            urlFastPathEnabled = prefs.getBoolean(PREFS_KEY_URL_FAST_PATH, true),
+            activeLockedPackageCount = lockedCount,
+            totalDetectionsCount = prefs.getInt(PREFS_KEY_TOTAL_DETECTIONS, 0)
         )
-    )
-    val state: StateFlow<AmnGazeState> = _state.asStateFlow()
+    }
 
     fun updateTheme(theme: AppTheme) {
         _state.update { it.copy(currentTheme = theme) }
+        prefs.edit().putInt(PREFS_KEY_APP_THEME, theme.ordinal).apply()
     }
 
     fun completeSetup() {
@@ -43,28 +59,44 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
         prefs.edit().putBoolean(PREFS_KEY_SETUP_COMPLETE, true).apply()
     }
 
+    fun acceptAccessibilityDisclosure() {
+        _state.update { it.copy(hasAcceptedAccessibilityDisclosure = true) }
+        prefs.edit().putBoolean(PREFS_KEY_DISCLOSURE_ACCEPTED, true).apply()
+    }
+
     fun toggleBackgroundPermission() {
-        _state.update {
-            val newValue = !it.permissionBackgroundDone
-            it.copy(permissionBackgroundDone = newValue)
-        }
+        _state.update { it.copy(permissionBackgroundDone = !it.permissionBackgroundDone) }
     }
 
     fun toggleNotificationsPermission() {
-        _state.update {
-            val newValue = !it.permissionNotificationsDone
-            it.copy(permissionNotificationsDone = newValue)
-        }
+        _state.update { it.copy(permissionNotificationsDone = !it.permissionNotificationsDone) }
     }
 
     fun toggleOverlayPermission() {
-        _state.update {
-            val newValue = !it.permissionOverlayDone
-            it.copy(permissionOverlayDone = newValue)
-        }
+        _state.update { it.copy(permissionOverlayDone = !it.permissionOverlayDone) }
     }
 
-    // ─── AmnGaze Blur configuration ──────────────────────────────────────────
+    // --- 3-Layer Accessibility Enforcement & Curtain Configuration ---
+
+    fun updateEnforcementMode(mode: EnforcementMode) {
+        val hardBlock = (mode == EnforcementMode.HARD_EJECT)
+        if (mode == EnforcementMode.CURTAIN_SHIELD) {
+            strikeLockoutManager.clearAllLockouts()
+        }
+        val now = SystemClock.elapsedRealtime()
+        val lockedCount = strikeLockoutManager.getActiveLockedPackages(now).size
+        _state.update {
+            it.copy(
+                enforcementMode = mode,
+                amnGazeHardBlockEnabled = hardBlock,
+                activeLockedPackageCount = lockedCount
+            )
+        }
+        prefs.edit()
+            .putInt(PREFS_KEY_ENFORCEMENT_MODE, mode.ordinal)
+            .putBoolean(PREFS_KEY_HARD_BLOCK_ENABLED, hardBlock)
+            .apply()
+    }
 
     fun updateBlurMode(mode: BlurTargetMode) {
         _state.update { it.copy(amnGazeBlurMode = mode) }
@@ -77,8 +109,9 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun updateBlurSensitivity(value: Float) {
-        _state.update { it.copy(amnGazeBlurSensitivity = value) }
-        prefs.edit().putFloat(PREFS_KEY_BLUR_SENSITIVITY, value).apply()
+        val clamped = value.coerceIn(0.2f, 0.95f)
+        _state.update { it.copy(amnGazeBlurSensitivity = clamped) }
+        prefs.edit().putFloat(PREFS_KEY_BLUR_SENSITIVITY, clamped).apply()
     }
 
     fun toggleBlurBadge() {
@@ -93,24 +126,48 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
         prefs.edit().putBoolean(PREFS_KEY_BLUR_SHOW_BORDER, updated).apply()
     }
 
-    fun toggleSkinHeuristic() {
-        val updated = !_state.value.amnGazeSkinHeuristic
-        _state.update { it.copy(amnGazeSkinHeuristic = updated) }
-        prefs.edit().putBoolean(PREFS_KEY_BLUR_SKIN_HEURISTIC, updated).apply()
-    }
-
     fun updateModelType(type: ModerationModelType) {
         _state.update { it.copy(amnGazeModelType = type) }
         prefs.edit().putInt(PREFS_KEY_MODEL_TYPE, type.ordinal).apply()
     }
 
     fun toggleHardBlock(enabled: Boolean) {
-        _state.update { it.copy(amnGazeHardBlockEnabled = enabled) }
-        prefs.edit().putBoolean(PREFS_KEY_HARD_BLOCK_ENABLED, enabled).apply()
+        val mode = if (enabled) EnforcementMode.HARD_EJECT else EnforcementMode.CURTAIN_SHIELD
+        updateEnforcementMode(mode)
     }
 
     fun updateHardBlockThreshold(threshold: Float) {
-        _state.update { it.copy(amnGazeHardBlockThreshold = threshold) }
-        prefs.edit().putFloat(PREFS_KEY_HARD_BLOCK_THRESHOLD, threshold).apply()
+        val clamped = threshold.coerceIn(0.5f, 0.95f)
+        _state.update { it.copy(amnGazeHardBlockThreshold = clamped) }
+        prefs.edit().putFloat(PREFS_KEY_HARD_BLOCK_THRESHOLD, clamped).apply()
+    }
+
+    fun toggleBlockIncognito() {
+        val updated = !_state.value.blockIncognitoEnabled
+        _state.update { it.copy(blockIncognitoEnabled = updated) }
+        prefs.edit().putBoolean(PREFS_KEY_BLOCK_INCOGNITO, updated).apply()
+    }
+
+    fun toggleUrlFastPath() {
+        val updated = !_state.value.urlFastPathEnabled
+        _state.update { it.copy(urlFastPathEnabled = updated) }
+        prefs.edit().putBoolean(PREFS_KEY_URL_FAST_PATH, updated).apply()
+    }
+
+    fun refreshProtectionMetrics() {
+        val now = SystemClock.elapsedRealtime()
+        val lockedCount = strikeLockoutManager.getActiveLockedPackages(now).size
+        val totalDetections = prefs.getInt(PREFS_KEY_TOTAL_DETECTIONS, 0)
+        _state.update {
+            it.copy(
+                activeLockedPackageCount = lockedCount,
+                totalDetectionsCount = totalDetections
+            )
+        }
+    }
+
+    fun clearAllLockouts() {
+        strikeLockoutManager.clearAllLockouts()
+        _state.update { it.copy(activeLockedPackageCount = 0) }
     }
 }

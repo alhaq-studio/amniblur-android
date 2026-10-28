@@ -1,6 +1,6 @@
 {
-  "name": "AmnGaze (AI-Powered Gaze Protection)",
-  "description": "On-device AI-powered visual shield protecting you by detecting explicit content and blurring it in real-time.",
+  "name": "AmnGaze",
+  "description": "On-device 3-Layer AI Accessibility content blocker and full-screen curtain shield powered by LiteRT.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

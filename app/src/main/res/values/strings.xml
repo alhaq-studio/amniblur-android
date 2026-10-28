@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">AmnGaze</string>
-    <string name="accessibility_service_description">AmnGaze monitors active web browsers to detect inappropriate websites and automatically apply real-time blur protection overlays.</string>
+    <string name="accessibility_service_description">AmnGaze uses AccessibilityService to inspect browser URLs and capture periodic on-device screenshots for local AI content filtering and full-screen shield protection. No images or browsing data ever leave your device.</string>
 </resources>
