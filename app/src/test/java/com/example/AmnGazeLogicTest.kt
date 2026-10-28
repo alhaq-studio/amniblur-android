@@ -154,7 +154,62 @@ class AmnGazeLogicTest {
         assertFalse(scanner.containsBlockedTerm("Hide NSFW content toggle in settings", isUrlBarNode = false))
         assertFalse(scanner.containsBlockedTerm("Order #XXX-12345 shipped. Check av.net status in app.", isUrlBarNode = false))
         assertFalse(scanner.containsBlockedTerm("https://developer.android.com/reference/android/accessibilityservice/AccessibilityService", isUrlBarNode = true))
-        assertEquals(0.75f, ContentModerationEngine.confidenceThresholdForSensitivity(0.5f), 0.001f)
+        assertEquals(0.50f, ContentModerationEngine.confidenceThresholdForSensitivity(0.5f), 0.001f)
+    }
+
+    @Test
+    fun testFiveClassNsfwScoringAndSafeUiGuard() {
+        // [0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy
+
+        // 1. Plain text UI / settings screen where neutral + drawings > 0.78f -> SAFE (0.0f)
+        val safeUiProbs = floatArrayOf(0.15f, 0.02f, 0.70f, 0.05f, 0.08f) // neutral + drawings = 0.85f > 0.78f
+        assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(safeUiProbs, includeSexyScore = true), 0.001f)
+
+        // 2. Real-world nudity / revealing frame splitting probability between porn (0.30) and sexy (0.50)
+        //    explicitScore = 0.30 + 0.05 = 0.35
+        //    combinedNsfwScore = 0.30 + 0.05 + (0.50 * 0.85) = 0.775
+        val splitNsfwProbs = floatArrayOf(0.03f, 0.05f, 0.12f, 0.30f, 0.50f)
+        assertEquals(
+            0.775f,
+            ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = true),
+            0.001f
+        )
+        // When user disables revealing/sexy class, only porn + hentai (0.35) is counted
+        assertEquals(
+            0.35f,
+            ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = false),
+            0.001f
+        )
+    }
+
+    @Test
+    fun testSensitivitySliderThresholdMapping() {
+        // 25% -> 0.62f, 50% -> 0.50f, 75% -> 0.38f, 95% -> 0.28f
+        assertEquals(0.62f, ContentModerationEngine.confidenceThresholdForSensitivity(0.25f), 0.005f)
+        assertEquals(0.50f, ContentModerationEngine.confidenceThresholdForSensitivity(0.50f), 0.005f)
+        assertEquals(0.38f, ContentModerationEngine.confidenceThresholdForSensitivity(0.75f), 0.005f)
+        assertEquals(0.28f, ContentModerationEngine.confidenceThresholdForSensitivity(0.95f), 0.005f)
+    }
+
+    @Test
+    fun testMultiCropExtractorOnTallPortraitBitmap() {
+        val tallBitmap = android.graphics.Bitmap.createBitmap(
+            1080,
+            2400,
+            android.graphics.Bitmap.Config.ARGB_8888
+        )
+        try {
+            val crops = ContentModerationEngine.extractMultiCrops(tallBitmap, targetSize = 224)
+            assertEquals(3, crops.size)
+            for (crop in crops) {
+                assertFalse(crop.isRecycled)
+                assertEquals(224, crop.width)
+                assertEquals(224, crop.height)
+                crop.recycle()
+            }
+        } finally {
+            tallBitmap.recycle()
+        }
     }
 
     @Test
@@ -163,6 +218,8 @@ class AmnGazeLogicTest {
             settleDelayMs = 180L,
             maxContinuousScrollWaitMs = 750L
         )
+        assertEquals(900L, controller.followUpVerificationDelayMs)
+        assertEquals(1500L, controller.videoHeartbeatIntervalMs)
 
         // Initial scroll events within 750ms schedule the 180ms settle timer
         assertEquals(ScrollScheduleAction.SCHEDULE_SETTLE_TIMER, controller.onScrollEvent(1_000L))
@@ -203,7 +260,18 @@ class AmnGazeLogicTest {
             )
         )
 
-        // 2. Launcher can NEVER record strikes or be locked out even after 10 attempts
+        // 2. Dynamic browser registration adds custom browsers but NEVER adds protected launchers
+        FastPathUrlAndKeywordScanner.registerDynamicBrowsers(
+            discoveredBrowserPackages = setOf("org.custom.browser.app", launcherPkg),
+            selfPackageName = "com.amngaze",
+            detectedHomePackages = setOf(launcherPkg)
+        )
+        assertTrue("org.custom.browser.app" in FastPathUrlAndKeywordScanner.BROWSER_PACKAGES)
+        assertTrue("com.google.android.apps.photos" in FastPathUrlAndKeywordScanner.HIGH_RISK_MEDIA_PACKAGES)
+        assertFalse(launcherPkg in FastPathUrlAndKeywordScanner.BROWSER_PACKAGES)
+        assertFalse(launcherPkg in FastPathUrlAndKeywordScanner.HIGH_RISK_MEDIA_PACKAGES)
+
+        // 3. Launcher can NEVER record strikes or be locked out even after 10 attempts
         for (i in 1..10) {
             val decision = manager.recordViolation(launcherPkg, 10_000L + i * 1_000L)
             assertEquals(0, decision.strikeCountInWindow)
@@ -211,7 +279,7 @@ class AmnGazeLogicTest {
         }
         assertFalse(manager.isPackageLocked(launcherPkg, 25_000L))
 
-        // 3. Overlay scoped to Chrome immediately dismisses when navigating to launcher or another app,
+        // 4. Overlay scoped to Chrome immediately dismisses when navigating to launcher or another app,
         //    but does NOT flicker when the soft keyboard appears inside Chrome
         assertFalse(
             FastPathUrlAndKeywordScanner.shouldDismissOverlayForPackageChange(

@@ -15,9 +15,10 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import kotlin.math.roundToInt
 
 /**
- * Whole-screen classification result returned by [ContentModerationEngine].
+ * Multi-crop / whole-screen classification result returned by [ContentModerationEngine].
  */
 data class VisionVerdict(
     val isViolation: Boolean,
@@ -28,36 +29,155 @@ data class VisionVerdict(
 )
 
 /**
- * On-Device Whole-Screen Content Moderation Engine leveraging Google AI Edge LiteRT (TensorFlow Lite).
+ * On-Device Multi-Crop Content Moderation Engine leveraging Google AI Edge LiteRT (TensorFlow Lite).
  *
- * Uses model-accurate preprocessing and output class mapping to eliminate false positives:
- * - [ModerationModelType.DEFAULT_NSFW] (`amn_gaze.tflite` — Yahoo OpenNSFW ResNet-50):
- *   224x224 FLOAT32 BGR with VGG mean subtraction (`B - 104f`, `G - 117f`, `R - 123f`),
- *   2-class output (`[0] = SFW`, `[1] = NSFW`).
- * - [ModerationModelType.QUANTIZED_NSFW] (`nsfw_mobilenet_v2_140_224_quantized.tflite` — GantMan 5-class MobileNetV2):
- *   224x224 RGB normalized `[0f..1f]` (FLOAT32) or UINT8 RGB,
- *   5-class output (`[0] = drawings`, `[1] = hentai`, `[2] = neutral`, `[3] = porn`, `[4] = sexy`),
- *   computing explicit score strictly from `porn` (`[3]`) + `hentai` (`[1]`).
- * - [ModerationModelType.GENDER_FILTER] (`model_lite_gender_q.tflite`):
- *   128x128 RGB normalized `[0f..1f]`, 2-class output.
+ * Implements all 4 core vision accuracy safeguards:
+ * 1. Dynamic Tensor Inspection (`inputTensor.shape()`, `inputTensor.dataType()`, `quantizationParams()`)
+ *    and MobileNetV2 RGB `[0.0f, 1.0f]` / `UINT8 [0..255]` preprocessing.
+ * 2. 5-Class MobileNetV2 NSFW scoring (`drawings [0]`, `hentai [1]`, `neutral [2]`, `porn [3]`, `sexy [4]`)
+ *    combining `porn + hentai + (sexy * 0.85f)` with a `neutral + drawings > 0.78f` safe-UI guard.
+ * 3. Aspect-ratio-preserving `360px` intermediate `HardwareBuffer` copy followed by 3 square `224x224`
+ *    active-content crops (Center, Upper-Middle 10%-55%, Lower-Middle 45%-90%) with short-circuit evaluation.
+ * 4. Calibrated sensitivity-to-threshold mapping (`25% -> 0.62f`, `50% -> 0.50f`, `75% -> 0.38f`, `95% -> 0.28f`).
  */
 class ContentModerationEngine(private val context: Context) {
     companion object {
-        private const val TAG = "ContentModerationEngine"
+        private const val TAG = "AmnGazeAI"
         const val DEFAULT_INPUT_SIZE = 224
-
-        // Yahoo open_nsfw BGR channel means
-        private const val VGG_MEAN_B = 104.0f
-        private const val VGG_MEAN_G = 117.0f
-        private const val VGG_MEAN_R = 123.0f
+        const val INTERMEDIATE_CAPTURE_WIDTH = 360
+        const val SAFE_UI_NEUTRAL_DRAWINGS_THRESHOLD = 0.78f
+        const val SEXY_CLASS_WEIGHT = 0.85f
 
         /**
-         * Maps user sensitivity (0.20..0.95, default 0.50) to a strict confidence threshold
-         * (0.58..0.90, default 0.75) so normal UI screens do not false-trigger.
+         * Maps user sensitivity (`0.20f..0.95f`, where higher sensitivity = lower threshold required to trigger):
+         * - At 25% Sensitivity (`0.25f`, Strict):     threshold = `0.62f`
+         * - At 50% Sensitivity (`0.50f`, Balanced):   threshold = `0.50f`
+         * - At 75% Sensitivity (`0.75f`, Aggressive): threshold = `0.38f`
+         * - At 95% Sensitivity (`0.95f`, Maximum):    threshold = `0.28f`
          */
         fun confidenceThresholdForSensitivity(sensitivity: Float): Float {
-            val clamped = sensitivity.coerceIn(0.2f, 0.95f)
-            return (1.0f - (clamped * 0.5f)).coerceIn(0.58f, 0.90f)
+            val s = sensitivity.coerceIn(0.20f, 0.95f)
+            val threshold = if (s <= 0.75f) {
+                0.74f - (0.48f * s)
+            } else {
+                0.38f - ((s - 0.75f) * 0.50f)
+            }
+            return threshold.coerceIn(0.28f, 0.66f)
+        }
+
+        /**
+         * Computes the 5-class MobileNetV2 NSFW violation score (`[0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy`).
+         * - Returns `0.0f` (SAFE) when `neutral + drawings > 0.78f` to prevent false triggers on plain text/UI chrome.
+         * - Otherwise returns `maxOf(porn + hentai, porn + hentai + sexy * 0.85f)` when [includeSexyScore] is true.
+         */
+        fun computeFiveClassNsfwScore(
+            probabilities: FloatArray,
+            includeSexyScore: Boolean = true
+        ): Float {
+            if (probabilities.size < 5) {
+                return if (probabilities.size >= 2) {
+                    probabilities[1].coerceIn(0f, 1f)
+                } else if (probabilities.isNotEmpty()) {
+                    probabilities[0].coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+            }
+
+            val drawingsProb = probabilities[0].coerceIn(0f, 1f)
+            val hentaiProb = probabilities[1].coerceIn(0f, 1f)
+            val neutralProb = probabilities[2].coerceIn(0f, 1f)
+            val pornProb = probabilities[3].coerceIn(0f, 1f)
+            val sexyProb = probabilities[4].coerceIn(0f, 1f)
+
+            // Safe UI / text screen guard
+            if ((neutralProb + drawingsProb) > SAFE_UI_NEUTRAL_DRAWINGS_THRESHOLD) {
+                return 0.0f
+            }
+
+            val explicitScore = pornProb + hentaiProb
+            val combinedNsfwScore = if (includeSexyScore) {
+                pornProb + hentaiProb + (sexyProb * SEXY_CLASS_WEIGHT)
+            } else {
+                explicitScore
+            }
+            return maxOf(explicitScore, combinedNsfwScore).coerceIn(0f, 1f)
+        }
+
+        /**
+         * Extracts 3 square `targetSize x targetSize` (default `224x224`) crops from a portrait or landscape
+         * screen bitmap after trimming the top 10% status/URL bar and bottom 10% navigation bar:
+         * 1. Crop 1 (Center Square): Centered vertically on the screen (`width x width`).
+         * 2. Crop 2 (Upper-Middle Content Square): Covering the upper content feed area (`10%` to `55%` height).
+         * 3. Crop 3 (Lower-Middle Content Square): Covering the lower content feed area (`45%` to `90%` height).
+         */
+        fun extractMultiCrops(
+            source: Bitmap,
+            targetSize: Int = DEFAULT_INPUT_SIZE
+        ): List<Bitmap> {
+            val w = source.width
+            val h = source.height
+            if (w <= 0 || h <= 0) return emptyList()
+
+            // If bitmap is landscape or nearly square, return a single center square crop
+            if (h <= (w * 1.15f).roundToInt()) {
+                val side = minOf(w, h)
+                val x = ((w - side) / 2).coerceAtLeast(0)
+                val y = ((h - side) / 2).coerceAtLeast(0)
+                val crop = Bitmap.createBitmap(source, x, y, side, side)
+                val scaled = if (crop.width == targetSize && crop.height == targetSize) {
+                    crop
+                } else {
+                    val s = Bitmap.createScaledBitmap(crop, targetSize, targetSize, true)
+                    if (s !== crop) crop.recycle()
+                    s
+                }
+                return listOf(scaled)
+            }
+
+            val activeTop = (h * 0.10f).roundToInt().coerceIn(0, h - 1)
+            val activeBottom = (h * 0.90f).roundToInt().coerceIn(activeTop + 1, h)
+            val upperRegionEnd = (h * 0.55f).roundToInt().coerceIn(activeTop + 1, activeBottom)
+            val lowerRegionStart = (h * 0.45f).roundToInt().coerceIn(activeTop, activeBottom - 1)
+
+            // Crop 1: Center Square (width x width, centered vertically)
+            val centerSide = minOf(w, h)
+            val centerY = ((h - centerSide) / 2).coerceIn(0, h - centerSide)
+
+            // Crop 2: Upper-Middle Content Square (within 10%..55% height band)
+            val upperBandHeight = (upperRegionEnd - activeTop).coerceAtLeast(1)
+            val upperSide = minOf(w, upperBandHeight, h)
+            val upperX = ((w - upperSide) / 2).coerceIn(0, w - upperSide)
+            val upperY = (activeTop + (upperBandHeight - upperSide) / 2).coerceIn(0, h - upperSide)
+
+            // Crop 3: Lower-Middle Content Square (within 45%..90% height band)
+            val lowerBandHeight = (activeBottom - lowerRegionStart).coerceAtLeast(1)
+            val lowerSide = minOf(w, lowerBandHeight, h)
+            val lowerX = ((w - lowerSide) / 2).coerceIn(0, w - lowerSide)
+            val lowerY = (lowerRegionStart + (lowerBandHeight - lowerSide) / 2).coerceIn(0, h - lowerSide)
+
+            val specs = listOf(
+                Triple(0, centerY, centerSide),
+                Triple(upperX, upperY, upperSide),
+                Triple(lowerX, lowerY, lowerSide)
+            )
+
+            val crops = ArrayList<Bitmap>(3)
+            for ((cx, cy, side) in specs) {
+                val safeX = cx.coerceIn(0, (w - 1).coerceAtLeast(0))
+                val safeY = cy.coerceIn(0, (h - 1).coerceAtLeast(0))
+                val safeSide = side.coerceIn(1, minOf(w - safeX, h - safeY))
+                val rawCrop = Bitmap.createBitmap(source, safeX, safeY, safeSide, safeSide)
+                val scaledCrop = if (rawCrop.width == targetSize && rawCrop.height == targetSize) {
+                    rawCrop
+                } else {
+                    val s = Bitmap.createScaledBitmap(rawCrop, targetSize, targetSize, true)
+                    if (s !== rawCrop) rawCrop.recycle()
+                    s
+                }
+                crops.add(scaledCrop)
+            }
+            return crops
         }
     }
 
@@ -88,7 +208,7 @@ class ContentModerationEngine(private val context: Context) {
                 options.addDelegate(gpuDelegate)
                 interpreter = Interpreter(modelBuffer, options)
                 loadedModelType = modelType
-                Log.i(TAG, "LiteRT Interpreter initialized with GPU delegate: $modelFileName")
+                logModelTensorDetails(modelFileName, "GPU")
             } catch (e: Throwable) {
                 Log.w(TAG, "GPU delegate unavailable for $modelFileName; falling back to multi-thread CPU.", e)
                 try {
@@ -102,7 +222,7 @@ class ContentModerationEngine(private val context: Context) {
                     }
                     interpreter = Interpreter(modelBuffer, cpuOptions)
                     loadedModelType = modelType
-                    Log.i(TAG, "LiteRT Interpreter initialized on CPU (4 threads): $modelFileName")
+                    logModelTensorDetails(modelFileName, "CPU-4T")
                 } catch (ex: Throwable) {
                     Log.e(TAG, "Failed to initialize LiteRT Interpreter on CPU for $modelFileName", ex)
                     interpreter = null
@@ -112,6 +232,25 @@ class ContentModerationEngine(private val context: Context) {
         } else {
             interpreter = null
             loadedModelType = null
+        }
+    }
+
+    private fun logModelTensorDetails(modelFileName: String, backend: String) {
+        val interp = interpreter ?: return
+        try {
+            val inTensor = interp.getInputTensor(0)
+            val outTensor = interp.getOutputTensor(0)
+            val inQ = inTensor.quantizationParams()
+            val outQ = outTensor.quantizationParams()
+            Log.i(
+                TAG,
+                "Loaded $modelFileName ($backend) | Input: shape=${inTensor.shape().contentToString()}, " +
+                    "type=${inTensor.dataType()}, q=(scale=${inQ.scale}, zp=${inQ.zeroPoint}) | " +
+                    "Output: shape=${outTensor.shape().contentToString()}, type=${outTensor.dataType()}, " +
+                    "q=(scale=${outQ.scale}, zp=${outQ.zeroPoint})"
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not inspect tensor metadata for $modelFileName", t)
         }
     }
 
@@ -143,21 +282,24 @@ class ContentModerationEngine(private val context: Context) {
     }
 
     /**
-     * Preprocesses an ARGB_8888 Bitmap according to the exact channel order and normalization
-     * expected by [modelType].
+     * Preprocesses an ARGB_8888 Bitmap according to the dynamic input tensor dataType and
+     * MobileNetV2 RGB normalization (`[0.0f, 1.0f]` for FLOAT32, or `0..255` bytes for UINT8).
      */
     fun preprocessBitmap(
         bitmap: Bitmap,
         inputSize: Int,
-        isQuantized: Boolean,
-        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW
+        inputDataType: DataType,
+        inputScale: Float = 0f,
+        inputZeroPoint: Int = 0,
+        useMinusOneToOneRange: Boolean = false
     ): ByteBuffer {
         val scaledBitmap = if (bitmap.width == inputSize && bitmap.height == inputSize) {
             bitmap
         } else {
             Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         }
-        val numBytesPerChannel = if (isQuantized) 1 else 4
+        val isByteInput = (inputDataType == DataType.UINT8 || inputDataType == DataType.INT8)
+        val numBytesPerChannel = if (isByteInput) 1 else 4
         val byteBuffer = ByteBuffer.allocateDirect(numBytesPerChannel * inputSize * inputSize * 3)
         byteBuffer.order(ByteOrder.nativeOrder())
 
@@ -170,22 +312,33 @@ class ContentModerationEngine(private val context: Context) {
             val g = ((pixelValue shr 8) and 0xFF)
             val b = (pixelValue and 0xFF)
 
-            if (isQuantized) {
-                // Quantized MobileNetV2 / Gender models use RGB byte order
-                byteBuffer.put(r.toByte())
-                byteBuffer.put(g.toByte())
-                byteBuffer.put(b.toByte())
-            } else {
-                when (modelType) {
-                    ModerationModelType.DEFAULT_NSFW -> {
-                        // Yahoo OpenNSFW expects BGR float32 with VGG mean subtraction
-                        byteBuffer.putFloat(b.toFloat() - VGG_MEAN_B)
-                        byteBuffer.putFloat(g.toFloat() - VGG_MEAN_G)
-                        byteBuffer.putFloat(r.toFloat() - VGG_MEAN_R)
+            when (inputDataType) {
+                DataType.UINT8 -> {
+                    byteBuffer.put(r.toByte())
+                    byteBuffer.put(g.toByte())
+                    byteBuffer.put(b.toByte())
+                }
+                DataType.INT8 -> {
+                    if (inputScale > 0f) {
+                        val qr = ((r / 255.0f) / inputScale + inputZeroPoint).roundToInt().coerceIn(-128, 127)
+                        val qg = ((g / 255.0f) / inputScale + inputZeroPoint).roundToInt().coerceIn(-128, 127)
+                        val qb = ((b / 255.0f) / inputScale + inputZeroPoint).roundToInt().coerceIn(-128, 127)
+                        byteBuffer.put(qr.toByte())
+                        byteBuffer.put(qg.toByte())
+                        byteBuffer.put(qb.toByte())
+                    } else {
+                        byteBuffer.put((r - 128).toByte())
+                        byteBuffer.put((g - 128).toByte())
+                        byteBuffer.put((b - 128).toByte())
                     }
-                    ModerationModelType.QUANTIZED_NSFW,
-                    ModerationModelType.GENDER_FILTER -> {
-                        // MobileNetV2 / Keras models expect RGB normalized to [0.0f, 1.0f]
+                }
+                else -> {
+                    if (useMinusOneToOneRange) {
+                        byteBuffer.putFloat((r - 127.5f) / 127.5f)
+                        byteBuffer.putFloat((g - 127.5f) / 127.5f)
+                        byteBuffer.putFloat((b - 127.5f) / 127.5f)
+                    } else {
+                        // Standard MobileNetV2 RGB normalized to [0.0f, 1.0f]
                         byteBuffer.putFloat(r.toFloat() / 255.0f)
                         byteBuffer.putFloat(g.toFloat() / 255.0f)
                         byteBuffer.putFloat(b.toFloat() / 255.0f)
@@ -201,35 +354,45 @@ class ContentModerationEngine(private val context: Context) {
         return byteBuffer
     }
 
+    /**
+     * Copies [hardwareBuffer] to an aspect-ratio-preserving software `ARGB_8888` bitmap (width `360px`,
+     * proportional height `~760px`), immediately closes [hardwareBuffer] in `finally`, and runs
+     * multi-crop LiteRT inference across 3 active-content square crops.
+     */
     @RequiresApi(Build.VERSION_CODES.Q)
     fun analyzeHardwareBuffer(
         hardwareBuffer: HardwareBuffer,
         colorSpace: ColorSpace?,
         sensitivity: Float = 0.5f,
-        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW
+        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW,
+        includeSexyScore: Boolean = true
     ): VisionVerdict {
         var hwBitmap: Bitmap? = null
-        var scaledBitmap: Bitmap? = null
+        var proportionalHwBitmap: Bitmap? = null
         var softwareBitmap: Bitmap? = null
 
         try {
             val targetColorSpace = colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
             hwBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, targetColorSpace)
-            if (hwBitmap != null) {
-                scaledBitmap = Bitmap.createScaledBitmap(
+            if (hwBitmap != null && hwBitmap.width > 0 && hwBitmap.height > 0) {
+                val targetWidth = INTERMEDIATE_CAPTURE_WIDTH
+                val targetHeight = ((hwBitmap.height.toFloat() / hwBitmap.width.toFloat()) * targetWidth)
+                    .roundToInt()
+                    .coerceAtLeast(DEFAULT_INPUT_SIZE)
+                proportionalHwBitmap = Bitmap.createScaledBitmap(
                     hwBitmap,
-                    DEFAULT_INPUT_SIZE,
-                    DEFAULT_INPUT_SIZE,
+                    targetWidth,
+                    targetHeight,
                     true
                 )
-                softwareBitmap = scaledBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                softwareBitmap = proportionalHwBitmap.copy(Bitmap.Config.ARGB_8888, false)
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed to copy HardwareBuffer to software ARGB_8888 bitmap.", t)
+            Log.e(TAG, "Failed to copy HardwareBuffer to proportional software ARGB_8888 bitmap.", t)
         } finally {
             try {
-                if (scaledBitmap != null && scaledBitmap !== hwBitmap) {
-                    scaledBitmap.recycle()
+                if (proportionalHwBitmap != null && proportionalHwBitmap !== hwBitmap) {
+                    proportionalHwBitmap.recycle()
                 }
             } catch (_: Throwable) {
             }
@@ -254,10 +417,11 @@ class ContentModerationEngine(private val context: Context) {
             )
 
         return try {
-            classifyBitmap(
-                bitmap = bitmapToAnalyze,
+            classifyScreenMultiCrop(
+                screenBitmap = bitmapToAnalyze,
                 sensitivity = sensitivity,
-                modelType = modelType
+                modelType = modelType,
+                includeSexyScore = includeSexyScore
             )
         } finally {
             try {
@@ -267,11 +431,88 @@ class ContentModerationEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Extracts 3 square `224x224` crops (Center, Upper-Middle 10%..55%, Lower-Middle 45%..90%) from
+     * [screenBitmap], evaluates them in order, short-circuits immediately if Crop 1 exceeds the
+     * threshold, and recycles all crop bitmaps cleanly.
+     */
+    @Synchronized
+    fun classifyScreenMultiCrop(
+        screenBitmap: Bitmap,
+        sensitivity: Float = 0.5f,
+        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW,
+        includeSexyScore: Boolean = true
+    ): VisionVerdict {
+        val threshold = confidenceThresholdForSensitivity(sensitivity)
+        if (loadedModelType != modelType || interpreter == null) {
+            reloadModel(modelType)
+        }
+
+        val interpreterInstance = interpreter
+            ?: return VisionVerdict(
+                isViolation = false,
+                confidence = 0f,
+                threshold = threshold,
+                categoryName = "MODEL_UNAVAILABLE",
+                modelType = modelType
+            )
+
+        val inputTensor = interpreterInstance.getInputTensor(0)
+        val inputShape = inputTensor.shape()
+        val inputSize = if (inputShape.size >= 3 && inputShape[1] > 0) inputShape[1] else DEFAULT_INPUT_SIZE
+
+        val crops = extractMultiCrops(screenBitmap, inputSize)
+        if (crops.isEmpty()) {
+            return classifyBitmap(screenBitmap, sensitivity, modelType, includeSexyScore)
+        }
+
+        var maxScore = 0f
+        var winningVerdict: VisionVerdict? = null
+
+        try {
+            for ((index, crop) in crops.withIndex()) {
+                val cropVerdict = classifySingleCropInternal(
+                    interpreterInstance = interpreterInstance,
+                    cropBitmap = crop,
+                    threshold = threshold,
+                    modelType = modelType,
+                    includeSexyScore = includeSexyScore,
+                    cropIndex = index
+                )
+                if (cropVerdict.confidence >= maxScore || winningVerdict == null) {
+                    maxScore = cropVerdict.confidence
+                    winningVerdict = cropVerdict
+                }
+                // Short-circuit immediately if Crop 1 (or any crop) exceeds the violation threshold
+                if (cropVerdict.isViolation) {
+                    return cropVerdict
+                }
+            }
+            return winningVerdict ?: VisionVerdict(
+                isViolation = false,
+                confidence = 0f,
+                threshold = threshold,
+                categoryName = "SAFE",
+                modelType = modelType
+            )
+        } finally {
+            for (crop in crops) {
+                try {
+                    if (crop !== screenBitmap && !crop.isRecycled) {
+                        crop.recycle()
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
     @Synchronized
     fun classifyBitmap(
         bitmap: Bitmap,
         sensitivity: Float = 0.5f,
-        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW
+        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW,
+        includeSexyScore: Boolean = true
     ): VisionVerdict {
         val threshold = confidenceThresholdForSensitivity(sensitivity)
 
@@ -288,58 +529,69 @@ class ContentModerationEngine(private val context: Context) {
                 modelType = modelType
             )
 
+        return classifySingleCropInternal(
+            interpreterInstance = interpreterInstance,
+            cropBitmap = bitmap,
+            threshold = threshold,
+            modelType = modelType,
+            includeSexyScore = includeSexyScore,
+            cropIndex = 0
+        )
+    }
+
+    private fun classifySingleCropInternal(
+        interpreterInstance: Interpreter,
+        cropBitmap: Bitmap,
+        threshold: Float,
+        modelType: ModerationModelType,
+        includeSexyScore: Boolean,
+        cropIndex: Int
+    ): VisionVerdict {
         return try {
             val inputTensor = interpreterInstance.getInputTensor(0)
             val inputShape = inputTensor.shape()
             val inputSize = if (inputShape.size >= 3 && inputShape[1] > 0) inputShape[1] else DEFAULT_INPUT_SIZE
             val inputDataType = inputTensor.dataType()
-            val isQuantized = (inputDataType == DataType.UINT8 || inputDataType == DataType.INT8)
-
-            val inputBuffer = preprocessBitmap(bitmap, inputSize, isQuantized, modelType)
+            val inQParams = inputTensor.quantizationParams()
 
             val outputTensor = interpreterInstance.getOutputTensor(0)
             val outputDataType = outputTensor.dataType()
             val outputShape = outputTensor.shape()
             val numClasses = if (outputShape.size >= 2 && outputShape[1] > 0) outputShape[1] else 2
 
-            val probabilities = FloatArray(numClasses)
+            val probabilities = runInferencePass(
+                interpreterInstance = interpreterInstance,
+                cropBitmap = cropBitmap,
+                inputSize = inputSize,
+                inputDataType = inputDataType,
+                inputScale = inQParams.scale,
+                inputZeroPoint = inQParams.zeroPoint,
+                outputTensor = outputTensor,
+                outputDataType = outputDataType,
+                numClasses = numClasses,
+                useMinusOneToOneRange = false
+            )
 
-            if (outputDataType == DataType.FLOAT32) {
-                val outputScores = Array(1) { FloatArray(numClasses) }
-                interpreterInstance.run(inputBuffer, outputScores)
-                for (i in 0 until numClasses) {
-                    probabilities[i] = outputScores[0][i]
-                }
-            } else {
-                val outputBuffer = ByteBuffer.allocateDirect(outputTensor.numBytes())
-                outputBuffer.order(ByteOrder.nativeOrder())
-                interpreterInstance.run(inputBuffer, outputBuffer)
-                outputBuffer.rewind()
-
-                val qParams = outputTensor.quantizationParams()
-                val scale = if (qParams.scale > 0f) qParams.scale else (1f / 255f)
-                val zeroPoint = qParams.zeroPoint
-
-                for (i in 0 until numClasses) {
-                    if (!outputBuffer.hasRemaining()) break
-                    val rawVal = if (outputDataType == DataType.UINT8) {
-                        outputBuffer.get().toInt() and 0xFF
-                    } else {
-                        outputBuffer.get().toInt()
-                    }
-                    probabilities[i] = ((rawVal - zeroPoint) * scale).coerceIn(0f, 1f)
-                }
-            }
-
-            // Compute explicit score accurately based on the model's output class schema:
-            // - 5-class GantMan MobileNetV2: [0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy
-            // - 2-class OpenNSFW / Gender: [0]=safe/male, [1]=explicit/female
             val score: Float = if (numClasses >= 5) {
-                val hentaiProb = probabilities[1]
-                val pornProb = probabilities[3]
-                (pornProb + hentaiProb).coerceIn(0f, 1f)
-            } else if (numClasses >= 2) {
-                probabilities[1].coerceIn(0f, 1f)
+                computeFiveClassNsfwScore(probabilities, includeSexyScore)
+            } else if (numClasses == 2) {
+                var bestTwoClassScore = probabilities[1].coerceIn(0f, 1f)
+                if (inputDataType == DataType.FLOAT32 && bestTwoClassScore < threshold) {
+                    val altProbs = runInferencePass(
+                        interpreterInstance = interpreterInstance,
+                        cropBitmap = cropBitmap,
+                        inputSize = inputSize,
+                        inputDataType = inputDataType,
+                        inputScale = inQParams.scale,
+                        inputZeroPoint = inQParams.zeroPoint,
+                        outputTensor = outputTensor,
+                        outputDataType = outputDataType,
+                        numClasses = numClasses,
+                        useMinusOneToOneRange = true
+                    )
+                    bestTwoClassScore = maxOf(bestTwoClassScore, altProbs[1].coerceIn(0f, 1f))
+                }
+                bestTwoClassScore
             } else {
                 probabilities[0].coerceIn(0f, 1f)
             }
@@ -355,7 +607,12 @@ class ContentModerationEngine(private val context: Context) {
                 "SAFE"
             }
 
-            Log.d(TAG, "Whole-screen LiteRT inference ($modelType, classes=$numClasses): score=$score, threshold=$threshold, violation=$isViolation")
+            Log.d(
+                TAG,
+                "LiteRT crop[$cropIndex] ($modelType, inType=$inputDataType, outType=$outputDataType, classes=$numClasses): " +
+                    "probs=${probabilities.contentToString()} -> score=$score, threshold=$threshold, violation=$isViolation"
+            )
+
             VisionVerdict(
                 isViolation = isViolation,
                 confidence = score,
@@ -364,7 +621,7 @@ class ContentModerationEngine(private val context: Context) {
                 modelType = modelType
             )
         } catch (e: Exception) {
-            Log.e(TAG, "LiteRT inference exception", e)
+            Log.e(TAG, "LiteRT inference exception on crop[$cropIndex]", e)
             VisionVerdict(
                 isViolation = false,
                 confidence = 0f,
@@ -373,6 +630,57 @@ class ContentModerationEngine(private val context: Context) {
                 modelType = modelType
             )
         }
+    }
+
+    private fun runInferencePass(
+        interpreterInstance: Interpreter,
+        cropBitmap: Bitmap,
+        inputSize: Int,
+        inputDataType: DataType,
+        inputScale: Float,
+        inputZeroPoint: Int,
+        outputTensor: org.tensorflow.lite.Tensor,
+        outputDataType: DataType,
+        numClasses: Int,
+        useMinusOneToOneRange: Boolean
+    ): FloatArray {
+        val inputBuffer = preprocessBitmap(
+            bitmap = cropBitmap,
+            inputSize = inputSize,
+            inputDataType = inputDataType,
+            inputScale = inputScale,
+            inputZeroPoint = inputZeroPoint,
+            useMinusOneToOneRange = useMinusOneToOneRange
+        )
+
+        val probabilities = FloatArray(numClasses)
+        if (outputDataType == DataType.FLOAT32) {
+            val outputScores = Array(1) { FloatArray(numClasses) }
+            interpreterInstance.run(inputBuffer, outputScores)
+            for (i in 0 until numClasses) {
+                probabilities[i] = outputScores[0][i]
+            }
+        } else {
+            val outputBuffer = ByteBuffer.allocateDirect(outputTensor.numBytes())
+            outputBuffer.order(ByteOrder.nativeOrder())
+            interpreterInstance.run(inputBuffer, outputBuffer)
+            outputBuffer.rewind()
+
+            val qParams = outputTensor.quantizationParams()
+            val scale = if (qParams.scale > 0f) qParams.scale else (1f / 255f)
+            val zeroPoint = qParams.zeroPoint
+
+            for (i in 0 until numClasses) {
+                if (!outputBuffer.hasRemaining()) break
+                val rawVal = if (outputDataType == DataType.UINT8) {
+                    outputBuffer.get().toInt() and 0xFF
+                } else {
+                    outputBuffer.get().toInt()
+                }
+                probabilities[i] = ((rawVal - zeroPoint) * scale).coerceIn(0f, 1f)
+            }
+        }
+        return probabilities
     }
 
     @Synchronized

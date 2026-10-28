@@ -58,15 +58,19 @@ AmnGaze is an on-device Android content protection application powered by Androi
   - `assets/nsfw.txt` domain lookups are restricted strictly to browser URL bar nodes (`isUrlBarNode == true`) or explicit `http://`, `https://`, or `www.` URLs, ignoring ultra-short `<7` char entries and allowlisted mainstream domains (`SAFE_DOMAIN_ALLOWLIST`).
   - Bounded 75-node UI text traversal runs only inside web browsers (`BROWSER_PACKAGES`) and matches 17 unambiguous standalone adult tokens (`pornhub`, `xvideos`, `xnxx`, `xhamster`, `youporn`, `spankbang`, `brazzers`, `eporner`, `chaturbate`, `redgifs`, `onlyfans`, `nhentai`, `hentai`, `porno`, `porn`, `sexchat`, `camgirl`) and 16 explicit domain markers (`pornhub.com`, `xvideos.com`, `xnxx.com`, `onlyfans.com`, `chaturbate.com`, `redgifs.com`, `xhamster.com`, `youporn.com`, `spankbang.com`, `brazzers.com`, `eporner.com`, `stripchat.com`, `cam4.com`, `rule34.xxx`, `nhentai.net`, `hanime.tv`). Ambiguous everyday words (`nude`, `nudes`, `naked`, `nsfw`, `xxx`) are excluded to prevent false triggers on cosmetics, fashion, masked numbers, or settings toggles.
 
-### Layer 2: Scroll-Settle Debounced `HardwareBuffer` Vision Pipeline (API 30+)
-- **Scoped High-Risk Package Eligibility**: Layer 1 & Layer 2 scanning runs strictly on browsers and high-risk media/social packages (`HIGH_RISK_MEDIA_PACKAGES`), leaving banking apps, calculators, settings, notes, and system utilities untouched.
-- **Hybrid Leading + Trailing Scroll Debouncer (`ScrollSettleDebounceController`)**:
-  - **Trailing Settle Scan (`180ms`)**: Captures crisp, stationary frames once a fling or scroll settles.
-  - **Continuous Scroll Ceiling (`750ms`)**: Forces a scan every `750ms` during continuous slow thumb-scrolling so explicit content cannot bypass detection.
-- **Version-Aware AOSP Rate-Limit Compliance**: Enforces `1050ms` on Android 11 (API 30) and `380ms` on Android 12+ (API 31+), guarded by `AtomicBoolean` (`isScreenshotInFlight`).
-- **Zero-Leak `HardwareBuffer` Lifecycle & Calibrated Model Preprocessing (`ContentModerationEngine`)**:
-  - Wraps `HardwareBuffer`, downscales to `224x224`, and copies to a software `Bitmap.Config.ARGB_8888` **before** recycling intermediate bitmaps and closing `hardwareBuffer.close()` inside a `try ... finally` block.
-  - Uses VGG BGR mean subtraction (`B - 104f, G - 117f, R - 123f`) for `amn_gaze.tflite`, 5-class probability summation (`porn [3] + hentai [1]`) for `nsfw_mobilenet_v2_140_224_quantized.tflite`, and a calibrated confidence threshold (`0.58f..0.90f`, `0.75f` at default `50%` sensitivity).
+### Layer 2: Multi-Crop `HardwareBuffer` Vision, Two-Stage Scroll & Video Heartbeat Pipeline (API 30+)
+- **Dynamic `PackageManager` Browser & Media App Discovery**: Queries `PackageManager` (`MATCH_ALL`) on startup for all installed `http://` and `https://` browsers and monitors an expanded set of gallery, search, social, and video apps (`HIGH_RISK_MEDIA_PACKAGES`), while keeping all `CATEGORY_HOME` launchers (`com.alhaq.amniquist`, etc.) 100% immune.
+- **Two-Stage Post-Scroll Scan (`180ms` + `900ms`)**:
+  - **Stage 1 (`180ms` Settle)**: Captures crisp frames immediately after a scroll gesture pauses.
+  - **Stage 2 (`+900ms` Verification)**: Automatically fires a follow-up scan `900ms` later to catch lazy-loaded web and feed images that finish downloading after scrolling stops.
+  - **Continuous Scroll Ceiling (`750ms`)**: Forces a scan every `750ms` during continuous slow scrolling.
+- **Active Media & Video Heartbeat (`1,500ms`)**: Periodically scans playing videos, Reels, GIFs, and lightbox images every `1,500ms` while an eligible app is active and `PowerManager.isInteractive` is `true`, stopping immediately when leaving the app or turning off the screen.
+- **3-Crop Aspect-Ratio Extraction (`ContentModerationEngine`)**:
+  - Copies `HardwareBuffer` once to a proportional `360px`-wide software `ARGB_8888` bitmap before closing `HardwareBuffer` in `finally`.
+  - Extracts 3 square `224x224` crops from the active content region (trimming top 10% status/URL bar and bottom 10% navigation bar): **Crop 1 (Center Square)** with immediate short-circuit, **Crop 2 (Upper-Middle 10%–55%)**, and **Crop 3 (Lower-Middle 45%–90%)**.
+- **Dynamic Tensor Inspection & 5-Class Scoring**:
+  - Inspects `inputTensor` and `outputTensor` dynamically (`FLOAT32` RGB `[0.0f..1.0f]` vs `UINT8` RGB `[0..255]` + `quantizationParams`).
+  - Combines `porn [3] + hentai [1] + (sexy [4] * 0.85f)` (configurable via dashboard toggle) with a `neutral [2] + drawings [0] > 0.78f` safe-UI guard and calibrated sensitivity thresholds (`25% -> 0.62`, `50% -> 0.50`, `75% -> 0.38`, `95% -> 0.28`).
 - **Browser-Scoped Incognito / `FLAG_SECURE` Enforcement**: Enforces `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` strictly when inside a browser package (`BROWSER_PACKAGES`), avoiding false blocks on `FLAG_SECURE` banking apps or password managers.
 
 ### Layer 3: `<2ms` App-Scoped Curtain Shield & Mode Separation (`BlurOverlayManager`)
@@ -80,9 +84,9 @@ AmnGaze is an on-device Android content protection application powered by Androi
 ---
 
 ## Bundled On-Device LiteRT Models (`app/src/main/assets/`)
-- `amn_gaze.tflite` — Default OpenNSFW Float32 classifier (VGG BGR mean subtraction `[104, 117, 123]`, 2-class `[SFW, NSFW]`)
-- `nsfw_mobilenet_v2_140_224_quantized.tflite` — Fast MobileNet V2 NSFW classifier (5-class `[drawings, hentai, neutral, porn, sexy]`)
-- `model_lite_gender_q.tflite` — Compact gender / revealing content classifier (`[0, 1]` RGB normalized)
+- `amn_gaze.tflite` — Default MobileNetV2 NSFW classifier (`[0.0f, 1.0f]` RGB normalized, dynamically inspected)
+- `nsfw_mobilenet_v2_140_224_quantized.tflite` — Fast MobileNetV2 NSFW classifier (5-class `[drawings, hentai, neutral, porn, sexy]`)
+- `model_lite_gender_q.tflite` — Compact gender / revealing content classifier (`[0.0f, 1.0f]` RGB normalized)
 - `nsfw.txt` — 79,961 adult domains loaded asynchronously into an in-memory O(1) `HashSet` (filtered to `>=7` chars and checked only on URL nodes)
 
 ---
@@ -90,9 +94,12 @@ AmnGaze is an on-device Android content protection application powered by Androi
 ## Roadmap & Implementation Status
 - [x] **v1.0**: Initial Compose UI, themes (`Sunset Glow`, `Emerald Calm`, `Cosmic Night`), and LiteRT model integration.
 - [x] **v2.0**: Replaced legacy `MediaProjection` regional bounding-box pipeline with `AmnGazeAccessibilityService` 3-Layer Curtain Shield & 3-Strike Lockout.
-- [x] **v2.1**: False-positive calibration (removed ambiguous keywords, restricted `nsfw.txt` to URL nodes `>=7` chars, VGG BGR mean subtraction & 5-class output mapping).
-- [x] **v2.2 (Current — App-Scoped Overlay, Launcher Immunity & Mode Separation)**:
-  - Scoped `BlurOverlayManager` strictly to `shieldedPackage` and auto-dismissed the overlay whenever the user exits the triggering app.
-  - Added `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL` (removed `FLAG_FULLSCREEN`) so system navigation gestures and touch never freeze.
-  - Added dynamic `CATEGORY_HOME` launcher detection + explicit protection for `com.alhaq.amniquist`, purging any non-eligible lockouts on startup.
-  - Decoupled `CURTAIN_SHIELD` mode from the 3-strike 15-minute lockout so Curtain Shield Mode always gives the 30-second unblur option and never locks out apps.
+- [x] **v2.1**: False-positive calibration (removed ambiguous keywords, restricted `nsfw.txt` to URL nodes `>=7` chars).
+- [x] **v2.2**: App-scoped overlay (`shieldedPackage`), non-freezing `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL` window flags, Home Launcher immunity (`com.alhaq.amniquist`), and strict separation of `CURTAIN_SHIELD` from 3-strike lockouts.
+- [x] **v2.3 (Current — Multi-Crop Vision, Lazy-Load Verification & Video Heartbeat)**:
+  - Implemented dynamic tensor inspection (`inputTensor` / `outputTensor`) and MobileNetV2 RGB `[0.0f, 1.0f]` / `UINT8` preprocessing.
+  - Added `sexy [4]` (`0.85x` weight, dashboard-configurable) + `neutral + drawings > 0.78f` safe-UI guard in 5-class NSFW scoring.
+  - Replaced full-screen squishing with 3 square `224x224` active-content crops (Center, Upper-Middle, Lower-Middle) extracted from a proportional `360px` copy.
+  - Recalibrated sensitivity thresholds (`25% -> 0.62`, `50% -> 0.50`, `75% -> 0.38`, `95% -> 0.28`).
+  - Added two-stage post-scroll scanning (`180ms` + `900ms`) for lazy-loaded images and a `1,500ms` active video heartbeat scanner.
+  - Added dynamic `PackageManager` browser discovery (`MATCH_ALL`) and expanded gallery/search/social media coverage.

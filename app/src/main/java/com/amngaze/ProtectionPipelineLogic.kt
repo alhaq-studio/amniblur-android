@@ -228,32 +228,101 @@ class FastPathUrlAndKeywordScanner(
             "com.brave.browser:id/url_bar",
             "com.sec.android.app.sbrowser:id/location_bar_edit_text",
             "org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+            "org.mozilla.fenix:id/mozac_browser_toolbar_url_view",
             "com.microsoft.emmx:id/url_bar",
-            "com.opera.browser:id/url_field"
+            "com.opera.browser:id/url_field",
+            "com.opera.mini.native:id/url_field",
+            "com.duckduckgo.mobile.android:id/omnibarTextInput",
+            "com.vivaldi.browser:id/url_bar",
+            "com.kiwibrowser.browser:id/url_bar"
         )
 
-        val BROWSER_PACKAGES = setOf(
+        val DEFAULT_BROWSER_PACKAGES = setOf(
             "com.android.chrome",
             "com.chrome.beta",
             "com.chrome.dev",
+            "com.chrome.canary",
             "org.mozilla.firefox",
+            "org.mozilla.firefox_beta",
             "org.mozilla.fenix",
+            "org.mozilla.focus",
             "com.brave.browser",
             "com.sec.android.app.sbrowser",
             "com.microsoft.emmx",
             "com.opera.browser",
-            "com.duckduckgo.mobile.android"
+            "com.opera.mini.native",
+            "com.opera.gx",
+            "com.duckduckgo.mobile.android",
+            "com.vivaldi.browser",
+            "com.kiwibrowser.browser",
+            "com.UCMobile.intl",
+            "com.yandex.browser",
+            "org.torproject.torbrowser",
+            "com.ecosia.android"
         )
 
-        val HIGH_RISK_MEDIA_PACKAGES = BROWSER_PACKAGES + setOf(
+        val DEFAULT_MEDIA_AND_SOCIAL_PACKAGES = setOf(
+            // Social & Messaging
             "com.instagram.android",
             "com.twitter.android",
             "com.zhiliaoapp.musically",
             "com.ss.android.ugc.trill",
             "com.reddit.frontpage",
             "org.telegram.messenger",
-            "com.discord"
+            "org.thunderdog.challegram",
+            "com.discord",
+            "com.facebook.katana",
+            "com.facebook.lite",
+            "com.snapchat.android",
+            "com.pinterest",
+            "com.tumblr",
+            "com.vkontakte.android",
+            "com.whatsapp",
+            // Search, Video & Media Players
+            "com.google.android.googlequicksearchbox",
+            "com.google.android.youtube",
+            "app.revanced.android.youtube",
+            "org.videolan.vlc",
+            "com.mxtech.videoplayer.ad",
+            "com.mxtech.videoplayer.pro",
+            // Gallery & Photo Viewers
+            "com.google.android.apps.photos",
+            "com.google.android.apps.nbu.files",
+            "com.sec.android.gallery3d",
+            "com.miui.gallery",
+            "com.coloros.gallery3d",
+            "com.oneplus.gallery",
+            "com.simplemobiletools.gallery.pro"
         )
+
+        @Volatile
+        var BROWSER_PACKAGES: Set<String> = DEFAULT_BROWSER_PACKAGES
+            private set
+
+        @Volatile
+        var HIGH_RISK_MEDIA_PACKAGES: Set<String> = DEFAULT_BROWSER_PACKAGES + DEFAULT_MEDIA_AND_SOCIAL_PACKAGES
+            private set
+
+        /**
+         * Dynamically registers installed browsers discovered via `PackageManager.queryIntentActivities`
+         * at runtime while ensuring protected Home Launchers (`com.alhaq.amniquist`, etc.) are never added.
+         */
+        @Synchronized
+        fun registerDynamicBrowsers(
+            discoveredBrowserPackages: Collection<String>,
+            selfPackageName: String = "com.amngaze",
+            detectedHomePackages: Set<String> = emptySet()
+        ) {
+            val safeBrowsers = discoveredBrowserPackages.filterNot { pkg ->
+                isProtectedLauncherOrSystemPackage(
+                    pkg = pkg,
+                    selfPackageName = selfPackageName,
+                    detectedHomePackages = detectedHomePackages
+                )
+            }
+            BROWSER_PACKAGES = DEFAULT_BROWSER_PACKAGES + safeBrowsers
+            HIGH_RISK_MEDIA_PACKAGES = BROWSER_PACKAGES + DEFAULT_MEDIA_AND_SOCIAL_PACKAGES
+        }
 
         /**
          * Launchers and core OS packages that must NEVER be scanned, locked, or covered by an overlay.
@@ -506,11 +575,15 @@ enum class ScrollScheduleAction {
 
 class ScrollSettleDebounceController(
     val settleDelayMs: Long = DEFAULT_SETTLE_DELAY_MS,
+    val followUpVerificationDelayMs: Long = DEFAULT_FOLLOW_UP_VERIFICATION_DELAY_MS,
+    val videoHeartbeatIntervalMs: Long = DEFAULT_VIDEO_HEARTBEAT_INTERVAL_MS,
     val maxContinuousScrollWaitMs: Long = DEFAULT_MAX_SCROLL_WAIT_MS,
     val windowChangeDelayMs: Long = DEFAULT_WINDOW_CHANGE_DELAY_MS
 ) {
     companion object {
         const val DEFAULT_SETTLE_DELAY_MS = 180L
+        const val DEFAULT_FOLLOW_UP_VERIFICATION_DELAY_MS = 900L
+        const val DEFAULT_VIDEO_HEARTBEAT_INTERVAL_MS = 1500L
         const val DEFAULT_MAX_SCROLL_WAIT_MS = 750L
         const val DEFAULT_WINDOW_CHANGE_DELAY_MS = 250L
 

@@ -44,6 +44,8 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
             amnGazeHardBlockThreshold = prefs.getFloat(PREFS_KEY_HARD_BLOCK_THRESHOLD, 0.85f),
             blockIncognitoEnabled = prefs.getBoolean(PREFS_KEY_BLOCK_INCOGNITO, true),
             urlFastPathEnabled = prefs.getBoolean(PREFS_KEY_URL_FAST_PATH, true),
+            videoHeartbeatEnabled = prefs.getBoolean(PREFS_KEY_VIDEO_HEARTBEAT, true),
+            includeSexyInNsfwScore = prefs.getBoolean(PREFS_KEY_INCLUDE_SEXY_SCORE, true),
             activeLockedPackageCount = lockedCount,
             totalDetectionsCount = prefs.getInt(PREFS_KEY_TOTAL_DETECTIONS, 0)
         )
@@ -152,6 +154,18 @@ class AmnGazeViewModel(application: Application) : AndroidViewModel(application)
         val updated = !_state.value.urlFastPathEnabled
         _state.update { it.copy(urlFastPathEnabled = updated) }
         prefs.edit().putBoolean(PREFS_KEY_URL_FAST_PATH, updated).apply()
+    }
+
+    fun toggleVideoHeartbeat() {
+        val updated = !_state.value.videoHeartbeatEnabled
+        _state.update { it.copy(videoHeartbeatEnabled = updated) }
+        prefs.edit().putBoolean(PREFS_KEY_VIDEO_HEARTBEAT, updated).apply()
+    }
+
+    fun toggleIncludeSexyScore() {
+        val updated = !_state.value.includeSexyInNsfwScore
+        _state.update { it.copy(includeSexyInNsfwScore = updated) }
+        prefs.edit().putBoolean(PREFS_KEY_INCLUDE_SEXY_SCORE, updated).apply()
     }
 
     fun refreshProtectionMetrics() {

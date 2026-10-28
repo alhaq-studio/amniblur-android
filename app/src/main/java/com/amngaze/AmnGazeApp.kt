@@ -1272,8 +1272,11 @@ fun MainDashboardScreen(
                                     .background(MaterialTheme.colorScheme.primaryContainer)
                                     .padding(horizontal = 10.dp, vertical = 4.dp)
                             ) {
+                                val activeThreshold = ContentModerationEngine.confidenceThresholdForSensitivity(
+                                    state.amnGazeBlurSensitivity
+                                )
                                 Text(
-                                    "${(state.amnGazeBlurSensitivity * 100).toInt()}%",
+                                    "${(state.amnGazeBlurSensitivity * 100).toInt()}% (Threshold: ${String.format("%.2f", activeThreshold)})",
                                     style = MaterialTheme.typography.labelMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
@@ -1334,6 +1337,26 @@ fun MainDashboardScreen(
                             title = "Layer 1: Fast-Path URL & 80k Domain Filter",
                             checked = state.urlFastPathEnabled,
                             onCheckedChange = { viewModel.toggleUrlFastPath() }
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                        )
+                        SettingsToggleRow(
+                            icon = Icons.Default.SlowMotionVideo,
+                            title = "Continuous Video & Media Heartbeat (1.5s)",
+                            checked = state.videoHeartbeatEnabled,
+                            onCheckedChange = { viewModel.toggleVideoHeartbeat() }
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                        )
+                        SettingsToggleRow(
+                            icon = Icons.Default.Tune,
+                            title = "Include Revealing / Swimwear (Sexy 0.85x Weight)",
+                            checked = state.includeSexyInNsfwScore,
+                            onCheckedChange = { viewModel.toggleIncludeSexyScore() }
                         )
                         HorizontalDivider(
                             modifier = Modifier.padding(horizontal = 16.dp),

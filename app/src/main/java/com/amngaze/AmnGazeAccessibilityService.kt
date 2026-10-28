@@ -3,9 +3,13 @@ package com.amngaze
 import android.accessibilityservice.AccessibilityService
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
@@ -33,8 +37,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   targeted browser URL bar lookup (`findAccessibilityNodeInfosByViewId`), and bounded
  *   75-node iterative BFS text/domain scan with strict `try ... finally` node cleanup.
  * - Layer 2 (API 30+): Hybrid Leading + Trailing Scroll-Settle Debounced `takeScreenshot()`
- *   (`180ms` settle delay + `750ms` continuous-scroll ceiling) guarded by `AtomicBoolean`
- *   and version-aware AOSP rate limits (`380ms` on API 31+, `1050ms` on API 30).
+ *   (`180ms` settle delay + `900ms` lazy-image verification + `750ms` continuous-scroll ceiling
+ *   + `1,500ms` active video/media heartbeat) guarded by `AtomicBoolean` and version-aware
+ *   AOSP rate limits (`380ms` on API 31+, `1050ms` on API 30).
  * - Layer 3 (<2ms): Pre-allocated `TYPE_ACCESSIBILITY_OVERLAY` whole-screen shield supporting
  *   Curtain Shield Mode ("Leave Page Safely" / "False Positive - Unblur for 30s") and
  *   Bulldog Hard Eject Mode (Auto-Back on Strikes 1-2, 15-minute lockout + Home on Strike 3).
@@ -81,6 +86,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
     private lateinit var moderationEngine: ContentModerationEngine
     private lateinit var overlayManager: BlurOverlayManager
     private lateinit var strikeLockoutManager: StrikeLockoutManager
+    private var powerManager: PowerManager? = null
     private val urlAndKeywordScanner = FastPathUrlAndKeywordScanner()
     private val scrollDebounceController = ScrollSettleDebounceController()
 
@@ -90,6 +96,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
     @Volatile
     private var activeForegroundPackage: String = ""
     private var lastContentFastPathScanMs: Long = 0L
+    private var isVideoHeartbeatActive: Boolean = false
 
     @Volatile
     private var detectedHomePackages: Set<String> = setOf("com.alhaq.amniquist")
@@ -98,6 +105,37 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         val pkg = activeForegroundPackage
         if (pkg.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isEligibleForVisualScan(pkg)) {
             executeScreenshotScan(pkg)
+        }
+    }
+
+    // FIX 5A: 900ms follow-up verification scan to catch lazy-loaded network images after scroll stops
+    private val followUpVerificationScanRunnable = Runnable {
+        val pkg = activeForegroundPackage
+        if (pkg.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isEligibleForVisualScan(pkg)) {
+            executeScreenshotScan(pkg)
+        }
+    }
+
+    // FIX 5B: 1,500ms active video/media heartbeat while an eligible app is open and screen is interactive
+    private val videoHeartbeatRunnable = object : Runnable {
+        override fun run() {
+            val pkg = activeForegroundPackage
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val heartbeatEnabled = prefs.getBoolean(PREFS_KEY_VIDEO_HEARTBEAT, true)
+            val isScreenInteractive = powerManager?.isInteractive ?: true
+
+            if (heartbeatEnabled &&
+                isScreenInteractive &&
+                pkg.isNotEmpty() &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                isEligibleForVisualScan(pkg) &&
+                !overlayManager.isShieldVisible
+            ) {
+                executeScreenshotScan(pkg)
+                mainHandler.postDelayed(this, scrollDebounceController.videoHeartbeatIntervalMs)
+            } else {
+                isVideoHeartbeatActive = false
+            }
         }
     }
 
@@ -114,7 +152,9 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         _isRunning.value = true
         Log.i(TAG, "AmnGaze 3-Layer AccessibilityService connected.")
 
+        powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
         refreshDetectedHomeLaunchers()
+        discoverInstalledBrowsers()
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         moderationEngine = ContentModerationEngine(this)
@@ -137,8 +177,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
 
     private fun refreshDetectedHomeLaunchers() {
         try {
-            val homeIntent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
-                addCategory(android.content.Intent.CATEGORY_HOME)
+            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
             }
             val resolveInfos = packageManager.queryIntentActivities(homeIntent, 0)
             val resolved = HashSet<String>()
@@ -153,6 +193,73 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             Log.i(TAG, "Detected protected Home Launcher packages: $detectedHomePackages")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to query HOME launcher packages; using default protected set.", e)
+        }
+    }
+
+    /**
+     * FIX 6: Dynamically discovers all installed browsers (`http://` and `https://` `ACTION_VIEW`)
+     * via `PackageManager` and merges them into [FastPathUrlAndKeywordScanner] while keeping
+     * all Home Launchers (`com.alhaq.amniquist`, `detectedHomePackages`) strictly excluded.
+     */
+    private fun discoverInstalledBrowsers() {
+        try {
+            val discovered = HashSet<String>()
+            for (scheme in listOf("https://www.example.com", "http://www.example.com")) {
+                val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(scheme)).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                }
+                val flags = PackageManager.MATCH_ALL
+                val resolveInfos = packageManager.queryIntentActivities(browserIntent, flags)
+                for (info in resolveInfos) {
+                    val pkg = info.activityInfo?.packageName
+                    if (!pkg.isNullOrBlank() && !isIgnoredSystemOrSelfPackage(pkg)) {
+                        discovered.add(pkg)
+                    }
+                }
+            }
+            if (discovered.isNotEmpty()) {
+                FastPathUrlAndKeywordScanner.registerDynamicBrowsers(
+                    discoveredBrowserPackages = discovered,
+                    selfPackageName = packageName,
+                    detectedHomePackages = detectedHomePackages
+                )
+                Log.i(TAG, "Dynamically registered ${discovered.size} installed browser packages: $discovered")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query installed browser packages; using expanded default set.", e)
+        }
+    }
+
+    private fun stopAllVisualScanTimers() {
+        mainHandler.removeCallbacks(settleScanRunnable)
+        mainHandler.removeCallbacks(followUpVerificationScanRunnable)
+        mainHandler.removeCallbacks(videoHeartbeatRunnable)
+        isVideoHeartbeatActive = false
+    }
+
+    private fun schedulePostScrollVisualScans(primaryDelayMs: Long) {
+        mainHandler.removeCallbacks(settleScanRunnable)
+        mainHandler.removeCallbacks(followUpVerificationScanRunnable)
+        mainHandler.postDelayed(settleScanRunnable, primaryDelayMs)
+        // Schedule 900ms follow-up verification scan to catch lazy-loaded network images
+        mainHandler.postDelayed(
+            followUpVerificationScanRunnable,
+            scrollDebounceController.followUpVerificationDelayMs
+        )
+    }
+
+    private fun ensureVideoHeartbeatState(pkg: String, prefs: android.content.SharedPreferences) {
+        val heartbeatEnabled = prefs.getBoolean(PREFS_KEY_VIDEO_HEARTBEAT, true)
+        val isScreenInteractive = powerManager?.isInteractive ?: true
+        if (!heartbeatEnabled || !isScreenInteractive || !isEligibleForVisualScan(pkg) || overlayManager.isShieldVisible) {
+            mainHandler.removeCallbacks(videoHeartbeatRunnable)
+            isVideoHeartbeatActive = false
+            return
+        }
+        if (!isVideoHeartbeatActive) {
+            isVideoHeartbeatActive = true
+            mainHandler.removeCallbacks(videoHeartbeatRunnable)
+            mainHandler.postDelayed(videoHeartbeatRunnable, scrollDebounceController.videoHeartbeatIntervalMs)
         }
     }
 
@@ -209,7 +316,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                 foregroundPackage = pkg
             )
         ) {
-            mainHandler.removeCallbacks(settleScanRunnable)
+            stopAllVisualScanTimers()
             mainHandler.removeCallbacks(autoDismissLockoutBannerRunnable)
             overlayManager.hide()
         }
@@ -218,7 +325,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         //    SystemUI, Settings, Keyboards, or any non-monitored app.
         if (isIgnoredSystemOrSelfPackage(pkg) || !isEligibleForVisualScan(pkg)) {
             if (!FastPathUrlAndKeywordScanner.isTransientInputMethodOverlay(pkg)) {
-                mainHandler.removeCallbacks(settleScanRunnable)
+                stopAllVisualScanTimers()
                 if (overlayManager.isShieldVisible) {
                     overlayManager.hide()
                 }
@@ -234,6 +341,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
 
         // 3. Check if user temporarily whitelisted this package for 30s ("False Positive - Unblur for 30s")
         if (strikeLockoutManager.isPackageWhitelisted(pkg, now)) {
+            stopAllVisualScanTimers()
             if (overlayManager.isShieldVisible && overlayManager.shieldedPackage == pkg) {
                 overlayManager.hide()
             }
@@ -288,15 +396,12 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 6. LAYER 2: Scroll-Settle Debounced HardwareBuffer Vision Pipeline (API 30+)
+        // 6. LAYER 2: Two-Stage Scroll-Settle + Video Heartbeat HardwareBuffer Vision Pipeline (API 30+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            ensureVideoHeartbeatState(pkg, prefs)
             when (eventType) {
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                    mainHandler.removeCallbacks(settleScanRunnable)
-                    mainHandler.postDelayed(
-                        settleScanRunnable,
-                        scrollDebounceController.windowChangeDelayMs
-                    )
+                    schedulePostScrollVisualScans(scrollDebounceController.windowChangeDelayMs)
                 }
                 AccessibilityEvent.TYPE_VIEW_SCROLLED,
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
@@ -304,13 +409,14 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                         ScrollScheduleAction.EXECUTE_IMMEDIATELY_MAX_WAIT_REACHED -> {
                             mainHandler.removeCallbacks(settleScanRunnable)
                             executeScreenshotScan(pkg)
+                            mainHandler.removeCallbacks(followUpVerificationScanRunnable)
+                            mainHandler.postDelayed(
+                                followUpVerificationScanRunnable,
+                                scrollDebounceController.followUpVerificationDelayMs
+                            )
                         }
                         ScrollScheduleAction.SCHEDULE_SETTLE_TIMER -> {
-                            mainHandler.removeCallbacks(settleScanRunnable)
-                            mainHandler.postDelayed(
-                                settleScanRunnable,
-                                scrollDebounceController.settleDelayMs
-                            )
+                            schedulePostScrollVisualScans(scrollDebounceController.settleDelayMs)
                         }
                     }
                 }
@@ -430,6 +536,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             prefs.getInt(PREFS_KEY_MODEL_TYPE, ModerationModelType.DEFAULT_NSFW.ordinal)
         ) { ModerationModelType.DEFAULT_NSFW }
         val blockIncognitoEnabled = prefs.getBoolean(PREFS_KEY_BLOCK_INCOGNITO, false)
+        val includeSexyScore = prefs.getBoolean(PREFS_KEY_INCLUDE_SEXY_SCORE, true)
 
         try {
             takeScreenshot(
@@ -442,7 +549,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                                 hardwareBuffer = screenshot.hardwareBuffer,
                                 colorSpace = screenshot.colorSpace,
                                 sensitivity = sensitivity,
-                                modelType = modelType
+                                modelType = modelType,
+                                includeSexyScore = includeSexyScore
                             )
                             if (verdict.isViolation) {
                                 val pct = (verdict.confidence * 100).toInt()
@@ -509,7 +617,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             return
         }
 
-        mainHandler.removeCallbacks(settleScanRunnable)
+        stopAllVisualScanTimers()
 
         val now = SystemClock.elapsedRealtime()
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -582,6 +690,8 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             return
         }
 
+        stopAllVisualScanTimers()
+
         val censorStyle = BlurCensorStyle.entries.getOrElse(
             prefs.getInt(PREFS_KEY_BLUR_CENSOR_STYLE, BlurCensorStyle.FROSTED.ordinal)
         ) { BlurCensorStyle.FROSTED }
@@ -623,6 +733,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             pkg.isNotEmpty() &&
             strikeLockoutManager.isPackageLocked(pkg, now)
 
+        stopAllVisualScanTimers()
         overlayManager.hide()
         if (isLocked) {
             performGlobalAction(GLOBAL_ACTION_HOME)
@@ -637,6 +748,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         if (pkg.isNotEmpty()) {
             strikeLockoutManager.whitelistPackageTemporarily(pkg, now)
         }
+        stopAllVisualScanTimers()
         overlayManager.hide()
     }
 
@@ -654,7 +766,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        mainHandler.removeCallbacks(settleScanRunnable)
+        stopAllVisualScanTimers()
         mainHandler.removeCallbacks(autoDismissLockoutBannerRunnable)
         overlayManager.hide()
     }

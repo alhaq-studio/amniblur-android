@@ -71,6 +71,8 @@ const val PREFS_KEY_HARD_BLOCK_ENABLED = "hard_block_enabled"
 const val PREFS_KEY_HARD_BLOCK_THRESHOLD = "hard_block_threshold"
 const val PREFS_KEY_BLOCK_INCOGNITO = "block_incognito_enabled"
 const val PREFS_KEY_URL_FAST_PATH = "url_fast_path_enabled"
+const val PREFS_KEY_VIDEO_HEARTBEAT = "video_heartbeat_enabled"
+const val PREFS_KEY_INCLUDE_SEXY_SCORE = "include_sexy_score_enabled"
 const val PREFS_KEY_LOCKED_PACKAGES = "locked_packages_entries"
 const val PREFS_KEY_TOTAL_DETECTIONS = "total_detections_count"
 
@@ -89,7 +91,7 @@ data class AmnGazeState(
     val enforcementMode: EnforcementMode = EnforcementMode.CURTAIN_SHIELD,
     val amnGazeBlurMode: BlurTargetMode = BlurTargetMode.FULL_SCREEN,
     val amnGazeCensorStyle: BlurCensorStyle = BlurCensorStyle.FROSTED,
-    /** Confidence threshold for detections. Range 0.2-0.95 */
+    /** User sensitivity slider (0.20..0.95). Maps to threshold 0.65..0.28 (50% -> 0.50). */
     val amnGazeBlurSensitivity: Float = 0.5f,
     val amnGazeShowBadge: Boolean = true,
     val amnGazeShowBorder: Boolean = true,
@@ -97,9 +99,11 @@ data class AmnGazeState(
     val amnGazeHardBlockEnabled: Boolean = false,
     val amnGazeHardBlockThreshold: Float = 0.85f,
 
-    // 3-Layer Pipeline Toggles
+    // 3-Layer Pipeline & Vision Toggles
     val blockIncognitoEnabled: Boolean = true,
     val urlFastPathEnabled: Boolean = true,
+    val videoHeartbeatEnabled: Boolean = true,
+    val includeSexyInNsfwScore: Boolean = true,
     val activeLockedPackageCount: Int = 0,
     val totalDetectionsCount: Int = 0
 )
