@@ -265,17 +265,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
 
     private fun loadBundledNsfwDomains() {
         try {
-            val domains = HashSet<String>(82_000)
-            assets.open("nsfw.txt").use { stream ->
-                BufferedReader(InputStreamReader(stream)).useLines { lines ->
-                    lines.forEach { line ->
-                        val trimmed = line.trim().lowercase()
-                        if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                            domains.add(trimmed)
-                        }
-                    }
-                }
-            }
+            val domains = FastPathUrlAndKeywordScanner.loadBundledDomainsFromAssets(this)
             urlAndKeywordScanner.updateBlockedDomains(domains)
             Log.i(TAG, "Loaded ${domains.size} adult domains into O(1) Layer 1 fast-path HashSet.")
         } catch (e: Exception) {

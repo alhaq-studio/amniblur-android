@@ -773,6 +773,15 @@ class AmnGazeLogicTest {
         assertTrue(scriptWithPreBlur.contains("window.__amngazePreBlurEnabled = true"))
         assertTrue(scriptWithPreBlur.contains("PREBLUR"))
         assertTrue(scriptWithPreBlur.contains("__amngazePrepareCleanCapture"))
+        assertTrue(scriptWithPreBlur.contains("MutationObserver"))
+        assertTrue(scriptWithPreBlur.contains("IntersectionObserver"))
+        assertTrue(scriptWithPreBlur.contains("amngazeSrc"))
+        val prepareCallIdx = scriptWithPreBlur.indexOf("window.__amngazePrepareCleanCapture();")
+        val batchCallIdx = scriptWithPreBlur.indexOf("window.AmnGazeBridge.onVisibleMediaBatch")
+        assertTrue(
+            "collectVisibleMedia must call __amngazePrepareCleanCapture() synchronously before onVisibleMediaBatch",
+            prepareCallIdx in 0 until batchCallIdx
+        )
     }
 
     @Test
@@ -894,7 +903,9 @@ class AmnGazeLogicTest {
     @Test
     fun testChildSafe30sSnoozeOnlyAppliesToTextKeywordMatchNeverAdultUrlOrVisualNsfw() {
         val lockoutManager = StrikeLockoutManager()
-        val scanner = FastPathUrlAndKeywordScanner()
+        val bundledDomains = FastPathUrlAndKeywordScanner.loadBundledDomainsFromAssets(context)
+        assertTrue("Bundled assets/nsfw.txt domain set must load into memory", bundledDomains.size > 50_000)
+        val scanner = FastPathUrlAndKeywordScanner(bundledDomains)
         val pkg = "com.android.chrome"
         val now = 50_000L
 

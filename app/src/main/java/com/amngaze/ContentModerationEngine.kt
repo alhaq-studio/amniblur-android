@@ -1203,12 +1203,21 @@ class ContentModerationEngine(private val context: Context) {
             }
             if (alreadyCovered) continue
 
+            val verifiedFaceInCell = results.firstOrNull { existing ->
+                !existing.isGridCell &&
+                    existing.gender != DetectedGender.UNKNOWN &&
+                    cellRect.contains(
+                        existing.normalizedRect.centerX(),
+                        existing.normalizedRect.centerY()
+                    )
+            }
+
             val cellCandidate = cropAndClassifyRegion(
                 frameBitmap = frameBitmap,
                 normRect = cellRect,
                 isFaceAnchor = false,
-                inheritedGender = null,
-                inheritedGenderConf = 0f,
+                inheritedGender = verifiedFaceInCell?.gender,
+                inheritedGenderConf = verifiedFaceInCell?.genderConfidence ?: 0f,
                 isGridCell = true
             )
             if (cellCandidate != null &&

@@ -299,6 +299,12 @@ class WebViewModerationBridge(
 
                     window.__amngazeRestoreAfterCapture = function() {
                         document.documentElement.classList.remove('__amngaze-clean-capture');
+                        if (window.__amngazePreBlurEnabled) {
+                            var preNodes = document.querySelectorAll('[data-amngaze-verdict="PREBLUR"]');
+                            for (var i = 0; i < preNodes.length; i++) {
+                                applyOverlayStyle(preNodes[i], window.__amngazeDefaultStyle, window.__amngazeDefaultStrengthPx);
+                            }
+                        }
                     };
 
                     function applyOverlayStyle(el, styleName, px) {
@@ -378,6 +384,26 @@ class WebViewModerationBridge(
                         } catch (e) {}
                     };
 
+                    function getMediaSrcKey(el) {
+                        return (el.currentSrc || el.src || el.getAttribute('srcset') || el.getAttribute('style') || '');
+                    }
+
+                    var intersectionObserver = null;
+                    if (typeof IntersectionObserver !== 'undefined') {
+                        intersectionObserver = new IntersectionObserver(function(entries) {
+                            var anyIntersecting = false;
+                            for (var i = 0; i < entries.length; i++) {
+                                if (entries[i].isIntersecting) {
+                                    anyIntersecting = true;
+                                    break;
+                                }
+                            }
+                            if (anyIntersecting) {
+                                collectVisibleMedia();
+                            }
+                        }, { rootMargin: '80px', threshold: 0.05 });
+                    }
+
                     function collectVisibleMedia() {
                         if (!window.AmnGazeBridge) return;
                         var vw = Math.max(window.innerWidth || 360, 1);
@@ -399,7 +425,20 @@ class WebViewModerationBridge(
                         var now = Date.now();
                         for (var i = 0; i < nodes.length; i++) {
                             var el = nodes[i];
+                            if (intersectionObserver && !el.dataset.amngazeObserved) {
+                                el.dataset.amngazeObserved = '1';
+                                try { intersectionObserver.observe(el); } catch (e) {}
+                            }
                             var tag = (el.tagName || 'IMG').toUpperCase();
+                            var srcKey = getMediaSrcKey(el);
+                            if (srcKey && el.dataset.amngazeSrc && el.dataset.amngazeSrc !== srcKey) {
+                                el.dataset.amngazeVerdict = '';
+                                el.dataset.amngazeLastScan = '0';
+                            }
+                            if (srcKey) {
+                                el.dataset.amngazeSrc = srcKey;
+                            }
+
                             var verdict = el.dataset.amngazeVerdict || '';
                             var lastScan = parseInt(el.dataset.amngazeLastScan || '0', 10);
 
@@ -416,7 +455,11 @@ class WebViewModerationBridge(
 
                             if (batch.length >= $MAX_BATCH_TILES) {
                                 hasMorePending = true;
-                                break;
+                                if (window.__amngazePreBlurEnabled && !verdict) {
+                                    el.dataset.amngazeVerdict = 'PREBLUR';
+                                    applyOverlayStyle(el, window.__amngazeDefaultStyle, window.__amngazeDefaultStrengthPx);
+                                }
+                                continue;
                             }
 
                             if (!el.dataset.amngazeId) {
@@ -424,7 +467,6 @@ class WebViewModerationBridge(
                             }
                             if (window.__amngazePreBlurEnabled && !verdict) {
                                 el.dataset.amngazeVerdict = 'PREBLUR';
-                                applyOverlayStyle(el, window.__amngazeDefaultStyle, window.__amngazeDefaultStrengthPx);
                             }
                             el.dataset.amngazeLastScan = String(now);
                             batch.push({
@@ -439,11 +481,41 @@ class WebViewModerationBridge(
                             });
                         }
                         if (batch.length > 0) {
+                            if (window.__amngazePreBlurEnabled && window.__amngazePrepareCleanCapture) {
+                                window.__amngazePrepareCleanCapture();
+                            }
                             window.AmnGazeBridge.onVisibleMediaBatch(JSON.stringify(batch));
                         }
                         if (hasMorePending) {
                             setTimeout(collectVisibleMedia, 160);
                         }
+                    }
+
+                    if (typeof MutationObserver !== 'undefined') {
+                        var domObserver = new MutationObserver(function(mutations) {
+                            var shouldScan = false;
+                            for (var m = 0; m < mutations.length; m++) {
+                                var mut = mutations[m];
+                                if (mut.type === 'attributes' && mut.target) {
+                                    mut.target.dataset.amngazeVerdict = '';
+                                    mut.target.dataset.amngazeLastScan = '0';
+                                    shouldScan = true;
+                                } else if (mut.addedNodes && mut.addedNodes.length > 0) {
+                                    shouldScan = true;
+                                }
+                            }
+                            if (shouldScan) {
+                                collectVisibleMedia();
+                            }
+                        });
+                        try {
+                            domObserver.observe(document.documentElement || document.body, {
+                                childList: true,
+                                subtree: true,
+                                attributes: true,
+                                attributeFilter: ['src', 'srcset', 'style']
+                            });
+                        } catch (e) {}
                     }
 
                     setInterval(collectVisibleMedia, 200);
@@ -459,6 +531,9 @@ class WebViewModerationBridge(
     private val isBatchProcessing = java.util.concurrent.atomic.AtomicBoolean(false)
 
     @Volatile
+    private var pendingBatchJson: String? = null
+
+    @Volatile
     private var attachedWebView: WebView? = null
 
     fun attachWebView(webView: WebView) {
@@ -467,13 +542,17 @@ class WebViewModerationBridge(
 
     fun detachWebView() {
         attachedWebView = null
+        pendingBatchJson = null
     }
 
     @JavascriptInterface
     fun onVisibleMediaBatch(jsonBatch: String) {
         val items = parseVisibleMediaBatchJson(jsonBatch)
         if (items.isEmpty()) return
-        if (!isBatchProcessing.compareAndSet(false, true)) return
+        if (!isBatchProcessing.compareAndSet(false, true)) {
+            pendingBatchJson = jsonBatch
+            return
+        }
 
         mainHandler.post {
             val webView = attachedWebView
@@ -489,10 +568,6 @@ class WebViewModerationBridge(
             }
 
             val currentState = stateProvider()
-            if (currentState.preBlurNewMediaUntilScanned) {
-                webView.evaluateJavascript("if(window.__amngazePrepareCleanCapture){window.__amngazePrepareCleanCapture();}", null)
-            }
-
             val targetW = VIEWPORT_CAPTURE_WIDTH
             val targetH = ((viewH.toFloat() / viewW.toFloat()) * targetW).roundToInt().coerceAtLeast(224)
             val snapshot = try {
@@ -511,6 +586,11 @@ class WebViewModerationBridge(
             }
             if (snapshot == null) {
                 isBatchProcessing.set(false)
+                val nextPending = pendingBatchJson
+                if (nextPending != null) {
+                    pendingBatchJson = null
+                    onVisibleMediaBatch(nextPending)
+                }
                 return@post
             }
             scope.launch(Dispatchers.Default) {
@@ -568,6 +648,11 @@ class WebViewModerationBridge(
                     } catch (_: Throwable) {
                     }
                     isBatchProcessing.set(false)
+                    val nextPending = pendingBatchJson
+                    if (nextPending != null) {
+                        pendingBatchJson = null
+                        onVisibleMediaBatch(nextPending)
+                    }
                 }
 
                 if (verdicts.isNotEmpty()) {

@@ -549,6 +549,34 @@ class FastPathUrlAndKeywordScanner(
         )
 
         private val TOKEN_SPLIT_REGEX = Regex("[^a-z0-9]+")
+
+        @Volatile
+        private var cachedBundledDomains: Set<String>? = null
+
+        @Synchronized
+        fun loadBundledDomainsFromAssets(context: android.content.Context): Set<String> {
+            cachedBundledDomains?.let { return it }
+            val loaded = try {
+                val domains = HashSet<String>(82_000)
+                context.assets.open("nsfw.txt").use { stream ->
+                    java.io.BufferedReader(java.io.InputStreamReader(stream)).useLines { lines ->
+                        lines.forEach { line ->
+                            val trimmed = line.trim().lowercase()
+                            if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+                                domains.add(trimmed)
+                            }
+                        }
+                    }
+                }
+                domains
+            } catch (_: Exception) {
+                emptySet()
+            }
+            if (loaded.isNotEmpty()) {
+                cachedBundledDomains = loaded
+            }
+            return loaded
+        }
     }
 
     @Volatile

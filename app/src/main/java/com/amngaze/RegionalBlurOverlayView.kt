@@ -95,8 +95,14 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
 
                     // 2. Dense mosaic grid where higher strength increases tile opacity and packing density
+                    //    (tile gaps shrink to 0f at >= 8/10 so nothing bleeds through)
                     val denseBlockDp = (26f - densityFactor * 14f).coerceIn(10f, 26f)
                     val blockSizePx = max(10f, denseBlockDp * density)
+                    val tileGapPx = if (effectStrength >= 8) {
+                        0f
+                    } else {
+                        ((1f - densityFactor) * 2.2f * density).coerceAtLeast(0.5f)
+                    }
                     val saveCount = canvas.save()
                     clipPath.reset()
                     clipPath.addRoundRect(screenRect, cornerRadius, cornerRadius, android.graphics.Path.Direction.CW)
@@ -108,14 +114,16 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                         var col = 0
                         var x = screenRect.left
                         val nextY = (y + blockSizePx).coerceAtMost(screenRect.bottom)
+                        val drawBottom = (nextY - tileGapPx).coerceAtLeast(y + 1f)
                         while (x < screenRect.right) {
                             val nextX = (x + blockSizePx).coerceAtMost(screenRect.right)
+                            val drawRight = (nextX - tileGapPx).coerceAtLeast(x + 1f)
                             mosaicBlockPaint.color = when ((row * 3 + col * 5) % 3) {
                                 0 -> Color.argb(alpha, 30, 41, 59)
                                 1 -> Color.argb(alpha, 51, 65, 85)
                                 else -> Color.argb(alpha, 39, 52, 73)
                             }
-                            canvas.drawRect(x, y, nextX, nextY, mosaicBlockPaint)
+                            canvas.drawRect(x, y, drawRight, drawBottom, mosaicBlockPaint)
                             x = nextX
                             col++
                         }

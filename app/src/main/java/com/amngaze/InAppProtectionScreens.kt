@@ -959,6 +959,15 @@ fun InAppBrowserScreen(
     val urlScanner = remember { FastPathUrlAndKeywordScanner() }
     val strikeLockoutManager = remember { StrikeLockoutManager() }
 
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val domains = FastPathUrlAndKeywordScanner.loadBundledDomainsFromAssets(context.applicationContext)
+            if (domains.isNotEmpty()) {
+                urlScanner.updateBlockedDomains(domains)
+            }
+        }
+    }
+
     val enabledPlatforms = remember(state.connectedPlatforms) {
         state.connectedPlatforms.filter { it.enabled }.ifEmpty { ConnectedPlatform.defaultPlatforms() }
     }
@@ -1080,10 +1089,10 @@ fun InAppBrowserScreen(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = if (activeViolation.triggerSource == ViolationTriggerSource.ADULT_DOMAIN_URL) {
-                        "Explicit Domain Blocked by AmnGaze"
-                    } else {
-                        "Explicit Keyword Blocked by AmnGaze"
+                    text = when (activeViolation.triggerSource) {
+                        ViolationTriggerSource.ADULT_DOMAIN_URL -> "Explicit Domain Blocked by AmnGaze"
+                        ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO -> "Explicit Media Blocked by AmnGaze"
+                        ViolationTriggerSource.TEXT_KEYWORD_MATCH -> "Explicit Keyword Blocked by AmnGaze"
                     },
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
@@ -1102,9 +1111,10 @@ fun InAppBrowserScreen(
                         blockedNavigationMatch = null
                         blockedTargetUri = null
                         webViewRef?.loadUrl(activePlatform.url)
-                    }
+                    },
+                    modifier = Modifier.testTag("in_app_leave_page_safely_button")
                 ) {
-                    Text("Return to ${activePlatform.name}")
+                    Text("Leave Page Safely (Return to ${activePlatform.name})")
                 }
                 if (canSnoozeKeyword) {
                     Spacer(modifier = Modifier.height(10.dp))
@@ -1145,33 +1155,43 @@ fun InAppBrowserScreen(
                         addJavascriptInterface(moderationBridge, "AmnGazeBridge")
 
                         webViewClient = object : WebViewClient() {
+                            private fun evaluateNavigationViolation(targetUri: String): ViolationMatch? {
+                                if (WhatToProtectItem.EXPLICIT_TEXT_URLS !in viewModel.state.value.whatToProtect) {
+                                    return null
+                                }
+                                val now = System.currentTimeMillis()
+                                val isKeywordSnoozed = strikeLockoutManager.isKeywordTextSnoozed(
+                                    activePlatform.id,
+                                    now
+                                )
+                                val violationMatch = urlScanner.findViolationMatch(
+                                    rawInput = targetUri,
+                                    isUrlBarNode = true,
+                                    isKeywordSnoozed = isKeywordSnoozed
+                                )
+                                return if (violationMatch != null &&
+                                    strikeLockoutManager.shouldBlockViolation(
+                                        activePlatform.id,
+                                        violationMatch.triggerSource,
+                                        now
+                                    )
+                                ) {
+                                    violationMatch
+                                } else {
+                                    null
+                                }
+                            }
+
                             override fun shouldOverrideUrlLoading(
                                 view: WebView?,
                                 request: WebResourceRequest?
                             ): Boolean {
                                 val targetUri = request?.url?.toString() ?: return false
-                                if (WhatToProtectItem.EXPLICIT_TEXT_URLS in viewModel.state.value.whatToProtect) {
-                                    val now = System.currentTimeMillis()
-                                    val isKeywordSnoozed = strikeLockoutManager.isKeywordTextSnoozed(
-                                        activePlatform.id,
-                                        now
-                                    )
-                                    val violationMatch = urlScanner.findViolationMatch(
-                                        rawInput = targetUri,
-                                        isUrlBarNode = true,
-                                        isKeywordSnoozed = isKeywordSnoozed
-                                    )
-                                    if (violationMatch != null &&
-                                        strikeLockoutManager.shouldBlockViolation(
-                                            activePlatform.id,
-                                            violationMatch.triggerSource,
-                                            now
-                                        )
-                                    ) {
-                                        blockedTargetUri = targetUri
-                                        blockedNavigationMatch = violationMatch
-                                        return true
-                                    }
+                                val violationMatch = evaluateNavigationViolation(targetUri)
+                                if (violationMatch != null) {
+                                    blockedTargetUri = targetUri
+                                    blockedNavigationMatch = violationMatch
+                                    return true
                                 }
                                 currentUrl = targetUri
                                 return false
@@ -1179,7 +1199,16 @@ fun InAppBrowserScreen(
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
-                                if (url != null) currentUrl = url
+                                if (url != null) {
+                                    val violationMatch = evaluateNavigationViolation(url)
+                                    if (violationMatch != null) {
+                                        view?.stopLoading()
+                                        blockedTargetUri = url
+                                        blockedNavigationMatch = violationMatch
+                                        return
+                                    }
+                                    currentUrl = url
+                                }
                                 injectDomProtectionScript(view, viewModel.state.value)
                             }
 
