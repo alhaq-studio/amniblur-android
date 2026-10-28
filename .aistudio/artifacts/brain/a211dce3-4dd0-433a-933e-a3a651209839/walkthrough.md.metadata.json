@@ -1,5 +1,5 @@
 {
-  "summary":  "Summary of the LiteRT inference pipeline optimizations, real-time unoccluded region restoration, strict gender-isolated skin/face/body blurring, opt-in pre-blur media setting, and 1..10 Effect Strength solidness & density curve reaching 100% solid opaque at 9-10/10.",
-  "updatedAt":  "2026-10-28T13:56:06.178550540Z",
+  "summary":  "Appended Section 7 documenting the 6 on-device image, lazy-loaded frame, and video NSFW detection fixes (dynamic tensor inspection, 5-class sexy + safe UI scoring, 3-crop aspect-ratio extraction, calibrated sensitivity thresholds, two-stage 180ms+900ms scroll scanning + 1500ms video heartbeat, and dynamic PackageManager browser discovery).",
+  "updatedAt":  "2026-10-28T00:31:46.667057424Z",
   "userFacing":  true
 }

@@ -37,11 +37,6 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
     }
     private val screenRect = RectF()
 
-    private val frostLayerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
-    private val clipPath = android.graphics.Path()
-
     fun updateBoxes(
         regions: List<TrackedBlurRegion>,
         style: HaramBlurOverlayStyle,
@@ -65,8 +60,6 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
 
         val density = resources.displayMetrics.density
         val cornerRadius = 14f * density
-        val alpha = HaramBlurFilterLogic.computeOverlayAlpha(effectStrength)
-        val densityFactor = HaramBlurFilterLogic.computeDensityFactor(effectStrength)
 
         for (region in activeRegions) {
             screenRect.set(
@@ -81,27 +74,16 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                 HaramBlurOverlayStyle.BLACK,
                 HaramBlurOverlayStyle.GRAY,
                 HaramBlurOverlayStyle.SKIN -> {
-                    // Scales solidness vs. transparency from 1/10 (alpha=115) up to 9..10/10 (alpha=255, 100% solid)
-                    boxFillPaint.color = HaramBlurFilterLogic.overlayColorArgb(overlayStyle, effectStrength)
+                    boxFillPaint.color = HaramBlurFilterLogic.overlayColorArgb(overlayStyle)
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
-                    if (alpha < 255) {
-                        canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, borderPaint)
-                    }
                 }
 
                 HaramBlurOverlayStyle.PIXELATE -> {
-                    // 1. Solid backing fill scaled by alpha (reaches 255 = 100% opaque at 9..10/10 so nothing bleeds through)
-                    boxFillPaint.color = Color.argb(alpha, 15, 23, 42)
-                    canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
-
-                    // 2. Dense mosaic grid where higher strength increases tile opacity and packing density
-                    val denseBlockDp = (26f - densityFactor * 14f).coerceIn(10f, 26f)
-                    val blockSizePx = max(10f, denseBlockDp * density)
+                    val blockSizePx = max(
+                        12f,
+                        HaramBlurFilterLogic.computePixelationBlockSizeDp(effectStrength) * density
+                    )
                     val saveCount = canvas.save()
-                    clipPath.reset()
-                    clipPath.addRoundRect(screenRect, cornerRadius, cornerRadius, android.graphics.Path.Direction.CW)
-                    canvas.clipPath(clipPath)
-
                     var row = 0
                     var y = screenRect.top
                     while (y < screenRect.bottom) {
@@ -110,10 +92,10 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                         val nextY = (y + blockSizePx).coerceAtMost(screenRect.bottom)
                         while (x < screenRect.right) {
                             val nextX = (x + blockSizePx).coerceAtMost(screenRect.right)
-                            mosaicBlockPaint.color = when ((row * 3 + col * 5) % 3) {
-                                0 -> Color.argb(alpha, 30, 41, 59)
-                                1 -> Color.argb(alpha, 51, 65, 85)
-                                else -> Color.argb(alpha, 39, 52, 73)
+                            mosaicBlockPaint.color = if ((row + col) % 2 == 0) {
+                                Color.argb(242, 30, 41, 59)
+                            } else {
+                                Color.argb(242, 51, 65, 85)
                             }
                             canvas.drawRect(x, y, nextX, nextY, mosaicBlockPaint)
                             x = nextX
@@ -127,31 +109,10 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                 }
 
                 HaramBlurOverlayStyle.BLUR -> {
-                    // 1. Primary frosted fill scaled by Effect Strength (1..10 -> alpha 115..255).
-                    //    At 9/10 and 10/10, alpha is 255 (100% solid opaque, zero see-through).
-                    boxFillPaint.color = Color.argb(alpha, 24, 34, 50)
+                    // Scale opacity with effectStrength (1..10 -> 215..252 alpha) for smooth frosted regional shield
+                    val alpha = (210 + (effectStrength.coerceIn(1, 10) * 4)).coerceIn(210, 254)
+                    boxFillPaint.color = Color.argb(alpha, 30, 41, 59)
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
-
-                    // 2. Multi-band frosted diffusion layers scaled by densityFactor (2..7 layers)
-                    val saveCount = canvas.save()
-                    clipPath.reset()
-                    clipPath.addRoundRect(screenRect, cornerRadius, cornerRadius, android.graphics.Path.Direction.CW)
-                    canvas.clipPath(clipPath)
-
-                    val layerCount = 2 + (densityFactor * 5f).toInt()
-                    val bandHeight = (screenRect.height() / layerCount.toFloat()).coerceAtLeast(6f)
-                    val layerAlpha = (45 + (densityFactor * 95f).toInt()).coerceIn(45, 140)
-                    for (i in 0 until layerCount) {
-                        val bandTop = screenRect.top + i * bandHeight
-                        val bandBottom = (bandTop + bandHeight).coerceAtMost(screenRect.bottom)
-                        frostLayerPaint.color = if (i % 2 == 0) {
-                            Color.argb(layerAlpha, 51, 65, 85)
-                        } else {
-                            Color.argb(layerAlpha, 30, 41, 59)
-                        }
-                        canvas.drawRect(screenRect.left, bandTop, screenRect.right, bandBottom, frostLayerPaint)
-                    }
-                    canvas.restoreToCount(saveCount)
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, borderPaint)
                 }
             }

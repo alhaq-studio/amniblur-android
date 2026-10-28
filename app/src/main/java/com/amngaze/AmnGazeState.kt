@@ -241,7 +241,6 @@ const val PREFS_KEY_HARAMBLUR_TARGET_GENDER = "haramblur_target_gender"
 const val PREFS_KEY_HARAMBLUR_SENSITIVITY = "haramblur_sensitivity"
 const val PREFS_KEY_HARAMBLUR_OVERLAY_STYLE = "haramblur_overlay_style"
 const val PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH = "haramblur_effect_strength"
-const val PREFS_KEY_PRE_BLUR_NEW_MEDIA = "pre_blur_new_media_until_scanned"
 
 // In-App Protection & Parental Controls keys
 const val PREFS_KEY_IN_APP_BLUR_STRENGTH_PX = "in_app_blur_strength_px"
@@ -298,7 +297,6 @@ data class AmnGazeState(
     val haramBlurSensitivity: HaramBlurSensitivity = HaramBlurSensitivity.MEDIUM,
     val haramBlurOverlayStyle: HaramBlurOverlayStyle = HaramBlurOverlayStyle.BLUR,
     val haramBlurEffectStrength: Int = 10, // 1..10
-    val preBlurNewMediaUntilScanned: Boolean = false,
 
     // In-App Protected WebView Hub & Shared Personalization
     val inAppBlurStrengthPx: Int = 10, // 1..20px
@@ -327,5 +325,5 @@ data class AmnGazeState(
             .ifEmpty { "None" }
 
     val blurStyleSummary: String
-        get() = "Smart (${haramBlurOverlayStyle.displayName}) - ${haramBlurEffectStrength}/10 (${inAppBlurStrengthPx}px)"
+        get() = "Smart (${haramBlurOverlayStyle.displayName}) - ${inAppBlurStrengthPx}px Strength"
 }

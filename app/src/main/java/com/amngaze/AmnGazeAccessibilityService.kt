@@ -287,18 +287,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         val rawEventPkg = event?.packageName?.toString() ?: return
 
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            val screenH = resources.displayMetrics.heightPixels.coerceAtLeast(640).toFloat()
-            val rawDeltaY = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                event.scrollDeltaY
-            } else {
-                0
-            }
-            val normDeltaY = if (rawDeltaY != 0) {
-                (-rawDeltaY.toFloat() / screenH).coerceIn(-0.40f, 0.40f)
-            } else {
-                0f
-            }
-            HaramBlurRuntimeBus.onScrollDetected(normDeltaY)
+            HaramBlurRuntimeBus.onScrollDetected(0f)
         }
 
         // Ignore Accessibility events emitted by our own overlay window so we never self-trigger
