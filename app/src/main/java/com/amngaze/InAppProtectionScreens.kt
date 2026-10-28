@@ -517,8 +517,10 @@ fun SettingsScreen(
         BlurStyleSheetDialog(
             currentStyle = state.haramBlurOverlayStyle,
             currentStrengthPx = state.inAppBlurStrengthPx,
+            preBlurNewMedia = state.preBlurNewMediaUntilScanned,
             onUpdateStyle = { viewModel.updateHaramBlurOverlayStyle(it) },
             onUpdateStrengthPx = { viewModel.updateInAppBlurStrengthPx(it) },
+            onTogglePreBlurNewMedia = { viewModel.setPreBlurNewMediaUntilScanned(it) },
             onDismiss = { showBlurStyleDialog = false }
         )
     }
@@ -1231,7 +1233,8 @@ private fun injectDomProtectionScript(webView: WebView?, state: AmnGazeState) {
         whatToProtect = state.whatToProtect,
         blurStyle = state.haramBlurOverlayStyle,
         strengthPx = state.inAppBlurStrengthPx,
-        feedControlConfig = state.feedControlConfig
+        feedControlConfig = state.feedControlConfig,
+        preBlurNewMediaUntilScanned = state.preBlurNewMediaUntilScanned
     )
     wv.evaluateJavascript(script, null)
 }
@@ -1481,10 +1484,16 @@ fun DetectionSensitivitySelectorDialog(
 fun BlurStyleSheetDialog(
     currentStyle: HaramBlurOverlayStyle,
     currentStrengthPx: Int,
+    preBlurNewMedia: Boolean = false,
     onUpdateStyle: (HaramBlurOverlayStyle) -> Unit,
     onUpdateStrengthPx: (Int) -> Unit,
+    onTogglePreBlurNewMedia: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
+    val strength10 = ((currentStrengthPx + 1) / 2).coerceIn(1, 10)
+    val solidnessPct = HaramBlurFilterLogic.computeOverlaySolidnessPercent(strength10)
+    val solidnessDesc = if (solidnessPct >= 100) "100% Solid (No See-Through)" else "${solidnessPct}% Solidness"
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Blur Style & Effect Strength", fontWeight = FontWeight.Bold) },
@@ -1505,7 +1514,7 @@ fun BlurStyleSheetDialog(
                     }
                 }
                 Text(
-                    "Effect Strength: ${currentStrengthPx}px",
+                    "Effect Strength: ${strength10}/10 (${currentStrengthPx}px • $solidnessDesc)",
                     fontWeight = FontWeight.SemiBold
                 )
                 Slider(
@@ -1514,6 +1523,28 @@ fun BlurStyleSheetDialog(
                     valueRange = 1f..20f,
                     steps = 18
                 )
+                HorizontalDivider()
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onTogglePreBlurNewMedia(!preBlurNewMedia) }
+                        .testTag("dialog_preblur_new_media_toggle"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Pre-Blur New Media Until Scanned", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Blur newly appearing images and videos until AI verification finishes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = preBlurNewMedia,
+                        onCheckedChange = { onTogglePreBlurNewMedia(it) }
+                    )
+                }
             }
         },
         confirmButton = {

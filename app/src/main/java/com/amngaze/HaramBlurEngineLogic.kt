@@ -20,7 +20,9 @@ data class CandidateBlurBox(
     val normalizedRect: RectF,
     val gender: DetectedGender,
     val genderConfidence: Float,
-    val nsfwConfidence: Float = 0f
+    val nsfwConfidence: Float = 0f,
+    val explicitPornNudityConfidence: Float = 0f,
+    val revealingSkinConfidence: Float = nsfwConfidence
 )
 
 data class TrackedBlurRegion(
@@ -39,32 +41,69 @@ object HaramBlurFilterLogic {
     const val DEFAULT_FACE_PADDING_FRACTION = 0.18f
     const val EXTERIOR_STATIONARY_DIFF_THRESHOLD = 0.04f
     const val DEFAULT_REGION_TTL_MS = 350L
-    const val DEFAULT_LERP_FACTOR = 0.45f
+    const val DEFAULT_LERP_FACTOR = 0.62f
+    const val MANDATORY_EXPLICIT_NUDITY_FLOOR = 0.55f
 
     /**
-     * Evaluates whether a detected face/figure candidate should be blurred based on
-     * [targetGender] (`FEMALE`, `MALE`, `BOTH`) and [sensitivity] (`LOW=0.70`, `MEDIUM=0.52`, `HIGH=0.35`).
+     * Evaluates whether a detected face/figure/skin candidate should be blurred based on:
+     * 1. Mandatory Pornography / Explicit Nudity Rule: Always blurs hardcore pornography or
+     *    explicit nudity ([CandidateBlurBox.explicitPornNudityConfidence]) for any gender.
+     * 2. Strict Gender-Isolated Detection ([targetGender] = `FEMALE`, `MALE`, `BOTH`):
+     *    - When `FEMALE` is selected, NEVER blurs verified `MALE` faces, figures, or exposed skin.
+     *    - When `MALE` is selected, NEVER blurs verified `FEMALE` faces, figures, or exposed skin.
+     *    - When `BOTH` is selected, blurs faces, figures, and exposed skin for both genders.
      */
     fun shouldBlurCandidate(
         candidate: CandidateBlurBox,
         targetGender: HaramBlurTargetGender,
         sensitivity: HaramBlurSensitivity
     ): Boolean {
-        val matchesGender = when (targetGender) {
-            HaramBlurTargetGender.FEMALE -> candidate.gender == DetectedGender.FEMALE
-            HaramBlurTargetGender.MALE -> candidate.gender == DetectedGender.MALE
-            HaramBlurTargetGender.BOTH ->
-                candidate.gender == DetectedGender.FEMALE || candidate.gender == DetectedGender.MALE
+        // 1. Mandatory blurring of hardcore pornography / explicit nudity for either or both genders
+        val mandatoryExplicitThreshold = max(MANDATORY_EXPLICIT_NUDITY_FLOOR, sensitivity.threshold)
+        if (candidate.explicitPornNudityConfidence >= mandatoryExplicitThreshold) {
+            return true
         }
-        if (!matchesGender && candidate.nsfwConfidence < sensitivity.threshold) {
-            return false
+
+        // 2. Strict gender isolation for face, figure, and exposed skin
+        return when (targetGender) {
+            HaramBlurTargetGender.FEMALE -> {
+                when (candidate.gender) {
+                    DetectedGender.MALE -> false // Strictly never blur male face/figure/skin in Female mode
+                    DetectedGender.FEMALE -> {
+                        val effectiveConf = max(
+                            candidate.genderConfidence,
+                            max(candidate.revealingSkinConfidence, candidate.nsfwConfidence)
+                        )
+                        effectiveConf >= sensitivity.threshold
+                    }
+                    DetectedGender.UNKNOWN -> {
+                        candidate.nsfwConfidence >= max(0.68f, sensitivity.threshold + 0.12f)
+                    }
+                }
+            }
+            HaramBlurTargetGender.MALE -> {
+                when (candidate.gender) {
+                    DetectedGender.FEMALE -> false // Strictly never blur female face/figure/skin in Male mode
+                    DetectedGender.MALE -> {
+                        val effectiveConf = max(
+                            candidate.genderConfidence,
+                            max(candidate.revealingSkinConfidence, candidate.nsfwConfidence)
+                        )
+                        effectiveConf >= sensitivity.threshold
+                    }
+                    DetectedGender.UNKNOWN -> {
+                        candidate.nsfwConfidence >= max(0.68f, sensitivity.threshold + 0.12f)
+                    }
+                }
+            }
+            HaramBlurTargetGender.BOTH -> {
+                val effectiveConf = max(
+                    candidate.genderConfidence,
+                    max(candidate.revealingSkinConfidence, candidate.nsfwConfidence)
+                )
+                effectiveConf >= sensitivity.threshold
+            }
         }
-        val effectiveConfidence = if (matchesGender) {
-            max(candidate.genderConfidence, candidate.nsfwConfidence)
-        } else {
-            candidate.nsfwConfidence
-        }
-        return effectiveConfidence >= sensitivity.threshold
     }
 
     /**
@@ -105,7 +144,44 @@ object HaramBlurFilterLogic {
     }
 
     /**
-     * Returns the exact ARGB color integer for the given [HaramBlurOverlayStyle].
+     * Maps Effect Strength (`1..10`) to an opacity alpha value (`115..255`) controlling
+     * transparency vs. solidness. At `9/10` and `10/10`, returns `255` (100% solid opaque,
+     * zero see-through).
+     */
+    fun computeOverlayAlpha(effectStrength: Int): Int {
+        return when (effectStrength.coerceIn(1, 10)) {
+            1 -> 115
+            2 -> 136
+            3 -> 156
+            4 -> 176
+            5 -> 196
+            6 -> 214
+            7 -> 230
+            8 -> 244
+            9 -> 255
+            else -> 255
+        }
+    }
+
+    /**
+     * Returns the user-facing solidness percentage (`45%..100%`) for a given Effect Strength (`1..10`).
+     */
+    fun computeOverlaySolidnessPercent(effectStrength: Int): Int {
+        val alpha = computeOverlayAlpha(effectStrength)
+        return ((alpha * 100 + 127) / 255).coerceIn(45, 100)
+    }
+
+    /**
+     * Maps Effect Strength (`1..10`) to a normalized density factor (`0.0f..1.0f`) controlling
+     * multi-band frosted diffusion layers and mosaic tile packing density.
+     */
+    fun computeDensityFactor(effectStrength: Int): Float {
+        val clamped = effectStrength.coerceIn(1, 10)
+        return ((clamped - 1) / 9f).coerceIn(0f, 1f)
+    }
+
+    /**
+     * Returns the base ARGB color integer for the given [HaramBlurOverlayStyle].
      */
     fun overlayColorArgb(style: HaramBlurOverlayStyle): Int {
         return when (style) {
@@ -116,6 +192,16 @@ object HaramBlurFilterLogic {
             HaramBlurOverlayStyle.SKIN -> 0xFFE8BEAC.toInt()
         }
     }
+
+    /**
+     * Returns the strength-adjusted ARGB color integer where alpha is scaled by [effectStrength] (`1..10`),
+     * reaching `0xFF` (`255` — 100% solid opaque) at strengths `9` and `10`.
+     */
+    fun overlayColorArgb(style: HaramBlurOverlayStyle, effectStrength: Int): Int {
+        val alpha = computeOverlayAlpha(effectStrength)
+        val rgb = overlayColorArgb(style) and 0x00FFFFFF
+        return (alpha shl 24) or rgb
+    }
 }
 
 /**
@@ -125,7 +211,7 @@ object HaramBlurFilterLogic {
  *   event has occurred, active [TrackedBlurRegion] boxes remain LOCKED even if the current frame's
  *   AI pass sees the rendered blur box itself and returns 0 candidates.
  * - Applies a `350ms` minimum persistence hold (`TTL`) and linear coordinate interpolation (`lerp`)
- *   so bounding boxes never jitter between frames.
+ *   so bounding boxes track smoothly in real time without jitter.
  */
 class AntiFlickerRegionTracker(
     val stationaryExteriorDiffThreshold: Float = HaramBlurFilterLogic.EXTERIOR_STATIONARY_DIFF_THRESHOLD,
