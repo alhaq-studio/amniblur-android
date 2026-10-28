@@ -56,17 +56,26 @@ import androidx.compose.ui.window.DialogProperties
 
 enum class Screen {
     WELCOME,
+    PROTECTION_MODE_SELECT,
     QUICK_SETUP,
-    MAIN_DASHBOARD
+    MAIN_DASHBOARD,
+    IN_APP_BROWSER,
+    SETTINGS,
+    CONNECTED_PLATFORMS
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AmnGazeApp(
-    viewModel: AmnGazeViewModel = viewModel()
+    viewModel: AmnGazeViewModel = viewModel(),
+    initialDeepLinkUrl: String? = null,
+    initialDeepLinkPlatformId: String? = null
 ) {
     val state by viewModel.state.collectAsState()
     var currentScreen by remember { mutableStateOf(Screen.WELCOME) }
+    var previousScreenBeforeSubRoute by remember { mutableStateOf(Screen.MAIN_DASHBOARD) }
+    val activeDeepLinkUrl by remember(initialDeepLinkUrl) { mutableStateOf(initialDeepLinkUrl) }
+    var isModeSelectFromSettings by remember { mutableStateOf(false) }
     var showDisclosureDialog by remember { mutableStateOf(false) }
     var showRestrictedSettingsDialog by remember { mutableStateOf(false) }
 
@@ -98,9 +107,19 @@ fun AmnGazeApp(
         }
     }
 
-    LaunchedEffect(state.isSetupComplete) {
-        if (state.isSetupComplete && currentScreen == Screen.WELCOME) {
-            currentScreen = Screen.MAIN_DASHBOARD
+    LaunchedEffect(state.isSetupComplete, initialDeepLinkUrl, initialDeepLinkPlatformId) {
+        if (initialDeepLinkPlatformId != null) {
+            viewModel.setActivePlatform(initialDeepLinkPlatformId)
+        }
+        if (!initialDeepLinkUrl.isNullOrBlank()) {
+            viewModel.completeSetup()
+            currentScreen = Screen.IN_APP_BROWSER
+        } else if (state.isSetupComplete && currentScreen == Screen.WELCOME) {
+            currentScreen = if (state.appProtectionMode == AppProtectionMode.IN_APP_PROTECTION) {
+                Screen.IN_APP_BROWSER
+            } else {
+                Screen.MAIN_DASHBOARD
+            }
         }
     }
 
@@ -113,13 +132,49 @@ fun AmnGazeApp(
             when (currentScreen) {
                 Screen.WELCOME -> WelcomeScreen(
                     onGetStarted = {
-                        currentScreen = Screen.QUICK_SETUP
+                        isModeSelectFromSettings = false
+                        currentScreen = Screen.PROTECTION_MODE_SELECT
                     }
                 )
 
+                Screen.PROTECTION_MODE_SELECT -> {
+                    BackHandler {
+                        currentScreen = if (isModeSelectFromSettings) {
+                            Screen.SETTINGS
+                        } else {
+                            Screen.WELCOME
+                        }
+                    }
+                    ProtectionModeScreen(
+                        initialMode = state.appProtectionMode,
+                        onSaveMode = { chosenMode ->
+                            viewModel.updateAppProtectionMode(chosenMode)
+                            if (isModeSelectFromSettings) {
+                                isModeSelectFromSettings = false
+                                currentScreen = if (chosenMode == AppProtectionMode.IN_APP_PROTECTION) {
+                                    Screen.IN_APP_BROWSER
+                                } else {
+                                    Screen.MAIN_DASHBOARD
+                                }
+                            } else if (chosenMode == AppProtectionMode.IN_APP_PROTECTION) {
+                                // Skip mandatory system permission gates in In-App Protection mode
+                                viewModel.completeSetup()
+                                currentScreen = Screen.IN_APP_BROWSER
+                            } else {
+                                currentScreen = Screen.QUICK_SETUP
+                            }
+                        },
+                        onBack = if (isModeSelectFromSettings) {
+                            { currentScreen = Screen.SETTINGS }
+                        } else {
+                            { currentScreen = Screen.WELCOME }
+                        }
+                    )
+                }
+
                 Screen.QUICK_SETUP -> {
                     BackHandler {
-                        currentScreen = Screen.WELCOME
+                        currentScreen = Screen.PROTECTION_MODE_SELECT
                     }
                     QuickSetupScreen(
                         isAccessibilityEnabled = isProtectionActive,
@@ -141,8 +196,84 @@ fun AmnGazeApp(
                     viewModel = viewModel,
                     isAmnGazeRunning = isProtectionActive,
                     onToggleAmnGaze = requestAccessibilitySetup,
-                    onOpenRestrictedSettingsHelp = { showRestrictedSettingsDialog = true }
+                    onOpenRestrictedSettingsHelp = { showRestrictedSettingsDialog = true },
+                    onOpenSettings = {
+                        previousScreenBeforeSubRoute = Screen.MAIN_DASHBOARD
+                        currentScreen = Screen.SETTINGS
+                    },
+                    onOpenInAppBrowser = {
+                        previousScreenBeforeSubRoute = Screen.MAIN_DASHBOARD
+                        currentScreen = Screen.IN_APP_BROWSER
+                    }
                 )
+
+                Screen.IN_APP_BROWSER -> InAppBrowserScreen(
+                    state = state,
+                    viewModel = viewModel,
+                    initialUrlOverride = activeDeepLinkUrl,
+                    onOpenSettings = {
+                        previousScreenBeforeSubRoute = Screen.IN_APP_BROWSER
+                        currentScreen = Screen.SETTINGS
+                    },
+                    onOpenManagePlatforms = {
+                        previousScreenBeforeSubRoute = Screen.IN_APP_BROWSER
+                        currentScreen = Screen.CONNECTED_PLATFORMS
+                    },
+                    onReturnToSystemDashboard = if (state.appProtectionMode == AppProtectionMode.SYSTEM_WIDE_PROTECTION) {
+                        { currentScreen = Screen.MAIN_DASHBOARD }
+                    } else {
+                        null
+                    }
+                )
+
+                Screen.SETTINGS -> {
+                    BackHandler {
+                        currentScreen = if (state.appProtectionMode == AppProtectionMode.IN_APP_PROTECTION) {
+                            Screen.IN_APP_BROWSER
+                        } else {
+                            Screen.MAIN_DASHBOARD
+                        }
+                    }
+                    SettingsScreen(
+                        state = state,
+                        viewModel = viewModel,
+                        onOpenProtectionModeChooser = {
+                            isModeSelectFromSettings = true
+                            currentScreen = Screen.PROTECTION_MODE_SELECT
+                        },
+                        onOpenConnectedPlatforms = {
+                            previousScreenBeforeSubRoute = Screen.SETTINGS
+                            currentScreen = Screen.CONNECTED_PLATFORMS
+                        },
+                        onOpenSystemWideDashboard = {
+                            currentScreen = Screen.MAIN_DASHBOARD
+                        },
+                        onBack = {
+                            currentScreen = if (state.appProtectionMode == AppProtectionMode.IN_APP_PROTECTION) {
+                                Screen.IN_APP_BROWSER
+                            } else {
+                                Screen.MAIN_DASHBOARD
+                            }
+                        }
+                    )
+                }
+
+                Screen.CONNECTED_PLATFORMS -> {
+                    BackHandler {
+                        currentScreen = previousScreenBeforeSubRoute
+                    }
+                    ConnectedPlatformsScreen(
+                        state = state,
+                        viewModel = viewModel,
+                        onSaveAndReturn = {
+                            currentScreen = if (state.appProtectionMode == AppProtectionMode.IN_APP_PROTECTION) {
+                                Screen.IN_APP_BROWSER
+                            } else {
+                                previousScreenBeforeSubRoute
+                            }
+                        }
+                    )
+                }
             }
 
             if (showDisclosureDialog) {
@@ -777,9 +908,20 @@ fun MainDashboardScreen(
     viewModel: AmnGazeViewModel,
     isAmnGazeRunning: Boolean,
     onToggleAmnGaze: () -> Unit,
-    onOpenRestrictedSettingsHelp: () -> Unit
+    onOpenRestrictedSettingsHelp: () -> Unit,
+    onOpenSettings: () -> Unit = {},
+    onOpenInAppBrowser: () -> Unit = {}
 ) {
     var showThemeMenu by remember { mutableStateOf(false) }
+    var pendingPinProtectedAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    val runWithPinGate: (() -> Unit) -> Unit = { action ->
+        if (state.parentalPinEnabled) {
+            pendingPinProtectedAction = action
+        } else {
+            action()
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -804,6 +946,16 @@ fun MainDashboardScreen(
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.testTag("dashboard_settings_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     IconButton(onClick = onOpenRestrictedSettingsHelp) {
                         Icon(
                             imageVector = Icons.Default.HelpOutline,
@@ -856,18 +1008,77 @@ fun MainDashboardScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
-                .padding(horizontal = 24.dp)
+                .padding(horizontal = 20.dp)
                 .testTag("dashboard_lazy_column"),
-            verticalArrangement = Arrangement.spacedBy(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 40.dp)
         ) {
-            // 1. Primary Accessibility Shield Status Card
+            // Quick-Launch Card for Protected In-App Browser Hub
             item {
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onOpenInAppBrowser() }
+                        .testTag("open_in_app_browser_card"),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Public,
+                                contentDescription = "In-App Protected Browser Hub",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Protected In-App Social & Browser Hub",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Browse ${state.enabledPlatformsSummary} with 120Hz DOM-locked blur & Feed Control",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                            contentDescription = "Open Browser Hub",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+
+            // =========================================================================
+            // MODULE 1: EXPLICIT & ADULT CONTENT BLOCKER (3-LAYER ACCESSIBILITY SHIELD)
+            // =========================================================================
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("master_card_explicit_blocker"),
                     shape = RoundedCornerShape(24.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = if (isAmnGazeRunning) {
+                        containerColor = if (state.isExplicitBlockerEnabled && isAmnGazeRunning) {
                             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f)
                         } else {
                             MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
@@ -875,95 +1086,98 @@ fun MainDashboardScreen(
                     ),
                     border = BorderStroke(
                         1.5.dp,
-                        if (isAmnGazeRunning) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                        if (state.isExplicitBlockerEnabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
                         else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
                     )
                 ) {
                     Column(
-                        modifier = Modifier.padding(20.dp),
+                        modifier = Modifier.padding(18.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        val infiniteTransition = rememberInfiniteTransition(label = "radar")
-                        val radarScale by infiniteTransition.animateFloat(
-                            initialValue = 1f,
-                            targetValue = 1.25f,
-                            animationSpec = infiniteRepeatable(
-                                animation = tween(1200, easing = EaseOutSine),
-                                repeatMode = RepeatMode.Restart
-                            ),
-                            label = "radarScale"
-                        )
-                        val radarAlpha by infiniteTransition.animateFloat(
-                            initialValue = 0.4f,
-                            targetValue = 0f,
-                            animationSpec = infiniteRepeatable(
-                                animation = tween(1200, easing = EaseOutSine),
-                                repeatMode = RepeatMode.Restart
-                            ),
-                            label = "radarAlpha"
-                        )
-
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier.size(100.dp)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (isAmnGazeRunning) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(80.dp)
-                                        .scale(radarScale)
-                                        .drawBehind {
-                                            drawCircle(
-                                                color = SunsetPrimary.copy(alpha = radarAlpha),
-                                                radius = size.minDimension / 2
-                                            )
-                                        }
-                                )
-                            }
-
                             Box(
                                 modifier = Modifier
-                                    .size(70.dp)
+                                    .size(48.dp)
                                     .clip(CircleShape)
                                     .background(
-                                        if (isAmnGazeRunning) MaterialTheme.colorScheme.primary
+                                        if (state.isExplicitBlockerEnabled) MaterialTheme.colorScheme.primary
                                         else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
                                     )
                                     .clickable { onToggleAmnGaze() },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = if (isAmnGazeRunning) Icons.Default.Shield else Icons.Default.PrivacyTip,
+                                    imageVector = if (state.isExplicitBlockerEnabled) Icons.Default.Shield else Icons.Default.PrivacyTip,
                                     contentDescription = "Toggle Accessibility Protection",
-                                    tint = if (isAmnGazeRunning) MaterialTheme.colorScheme.onPrimary
+                                    tint = if (state.isExplicitBlockerEnabled) MaterialTheme.colorScheme.onPrimary
                                     else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(32.dp)
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(12.dp))
+
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { viewModel.toggleExplicitSettingsDropdown() }
+                            ) {
+                                Text(
+                                    text = "MASTER MODULE 1: 3-LAYER ACCESSIBILITY SHIELD",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "Explicit & Adult Content Blocker",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = when {
+                                        !state.isExplicitBlockerEnabled -> "Explicit Blocker paused by Master Toggle"
+                                        isAmnGazeRunning -> "Fast-path URL filtering, multi-crop LiteRT vision & Curtain Shield active"
+                                        else -> "Enable AmnGaze in Android Accessibility Settings to activate protection"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            Switch(
+                                checked = state.isExplicitBlockerEnabled,
+                                onCheckedChange = { shouldEnable ->
+                                    if (shouldEnable) {
+                                        viewModel.setExplicitBlockerEnabled(true)
+                                    } else {
+                                        runWithPinGate {
+                                            viewModel.setExplicitBlockerEnabled(false)
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.testTag("master_toggle_explicit")
+                            )
+
+                            IconButton(
+                                onClick = { viewModel.toggleExplicitSettingsDropdown() },
+                                modifier = Modifier.testTag("dropdown_toggle_explicit")
+                            ) {
+                                Icon(
+                                    imageVector = if (state.isExplicitSettingsExpanded) {
+                                        Icons.Default.ExpandLess
+                                    } else {
+                                        Icons.Default.ExpandMore
+                                    },
+                                    contentDescription = "Expand or Collapse Explicit Blocker Settings"
                                 )
                             }
                         }
 
                         Spacer(modifier = Modifier.height(14.dp))
-
-                        Text(
-                            text = if (isAmnGazeRunning) "3-Layer Accessibility Shield Active" else "Accessibility Shield Inactive",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = if (isAmnGazeRunning) {
-                                "Fast-path URL filtering, scroll-debounced LiteRT vision, and <2ms full-screen curtain shield are active."
-                            } else {
-                                "Enable AmnGaze in Android Accessibility Settings to activate zero-flicker protection."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(horizontal = 12.dp)
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
 
                         Button(
                             onClick = onToggleAmnGaze,
@@ -990,6 +1204,7 @@ fun MainDashboardScreen(
                 }
             }
 
+            if (state.isExplicitSettingsExpanded) {
             // 2. Whole-Screen Curtain & Enforcement Live Preview Card
             item {
                 val backdropColor = when (state.amnGazeCensorStyle) {
@@ -1518,7 +1733,7 @@ fun MainDashboardScreen(
                         }
                         if (state.activeLockedPackageCount > 0) {
                             OutlinedButton(
-                                onClick = { viewModel.clearAllLockouts() },
+                                onClick = { runWithPinGate { viewModel.clearAllLockouts() } },
                                 modifier = Modifier.testTag("clear_lockouts_button")
                             ) {
                                 Text("Reset Lockouts")
@@ -1526,6 +1741,16 @@ fun MainDashboardScreen(
                         }
                     }
                 }
+            }
+            } // End of Module 1 (Explicit Content Blocker) Collapsible Settings
+
+            // Module 2: HaramBlur Real-Time Regional Face & Figure Blur (MediaProjection + Accessibility Hybrid)
+            item {
+                HaramBlurMasterModuleCard(
+                    state = state,
+                    viewModel = viewModel,
+                    runWithPinGate = runWithPinGate
+                )
             }
 
             // 9. Privacy & Architecture Summary Footer
@@ -1555,7 +1780,7 @@ fun MainDashboardScreen(
                         }
                         Text(
                             "AmnGaze runs 100% locally in RAM with zero cloud uploads. " +
-                                "Scroll-settled screenshots (180ms settle / 750ms ceiling) and HardwareBuffers are recycled immediately after inference. " +
+                                "Scroll-settled screenshots (180ms settle / 750ms ceiling), MediaProjection regional frames, and HardwareBuffers are recycled immediately after inference. " +
                                 "Active Model: $modelLabel.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1564,6 +1789,17 @@ fun MainDashboardScreen(
                 }
             }
         }
+    }
+
+    pendingPinProtectedAction?.let { action ->
+        ParentalPinPromptDialog(
+            onVerifyPin = { entered -> viewModel.verifyParentalPin(entered) },
+            onSuccess = {
+                pendingPinProtectedAction = null
+                action()
+            },
+            onDismiss = { pendingPinProtectedAction = null }
+        )
     }
 }
 

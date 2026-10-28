@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for fixing on-device image, lazy-loaded web frame, and video NSFW detection across ContentModerationEngine, ProtectionPipelineLogic, AmnGazeAccessibilityService, and the MainDashboardScreen UI controls.",
-  "updatedAt":  "2026-10-28T00:14:47.461510158Z",
+  "summary":  "Revised implementation plan incorporating: (1) Effect Strength (1..10) solidness vs. transparency and density scaling up to 100% opaque (alpha = 255, zero see-through) across all overlay styles and WebView overlays, (2) careful, non-destructive LiteRT tensor & frame-processing optimizations, (3) gender-isolated detection accuracy (Female vs. Male face + linked skin/body region without opposite-gender false positives), (4) real-time unoccluded region tracking, and (5) opt-in pre-blur setting for newly appearing media.",
+  "updatedAt":  "2026-10-28T13:34:13.239921523Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

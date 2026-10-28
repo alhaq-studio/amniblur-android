@@ -1,120 +1,101 @@
-# AmnGaze — On-Device Image, Lazy-Loaded Frame & Video NSFW Detection Plan
+# Real-Time LiteRT Inference Optimization, Gender-Isolated Detection, Solid Blur Intensity (`1..10`) & Dynamic Overlay Persistence Plan
 
-This plan details the 6 root-cause upgrades to restore fast, accurate on-device image and video-frame NSFW detection using Google AI Edge LiteRT (`.tflite`) and Android's `AccessibilityService` screenshot pipeline, while preserving zero false-triggers on safe text UI and full Home Launcher immunity.
+## 1. Root-Cause Findings from Codebase & Model Investigation
 
----
+### A. Why Blur Intensity / Effect Strength (`1..10`) Could Not Reach Solid (Zero See-Through)
+1. **Hard-Capped Alpha Below `255` in `RegionalBlurOverlayView.kt`:**
+   - **Blur Style (`drawBlurStyle`, line 99):** `val alpha = (175 + (effectStrength.coerceIn(1, 10) * 6)).coerceIn(180, 240)` hard-caps alpha at `240` (`~94%`), never reaching `255` (100% solid opaque). Even at `10/10`, underlying high-contrast colors/silhouettes bleed through the translucent region.
+   - **Pixelate Style (`drawPixelateStyle`, lines 123–145):** Base fill alpha is hardcoded to `215` (`~84%`) and grid cells are hardcoded to `160..245` regardless of `effectStrength`. In addition, `computePixelationBlockSizeDp()` scaled blocks from `8dp` (`1/10`) up to `36dp` (`10/10`), making `10/10` *coarser/sparser* with gaps instead of denser and more solid.
+   - **Solid Styles (`drawSolidStyle`, lines 170–174):** `GRAY` and `SKIN` cap alpha at `250` (`coerceIn(205, 250)`), never reaching `255` opaque, while `BLACK` starts at `223` at `1/10` rather than offering a smooth transparency-to-solidness range across `1..10`.
+2. **In-App WebView CSS Blur Bleed-Through (`WebViewModerationBridge.kt`, lines 288–305):**
+   - Applying CSS `filter: blur(Npx)` alone leaves low-frequency skin/color contours visible at high strength unless paired with progressive contrast compression and solid backdrop opacity scaling at higher strength levels (`8..10/10`).
 
-## User Review & Critical Decisions
+### B. Why Selecting `Female` Still Blurred `Male` Faces, Figures & Skin (and Vice-Versa)
+1. **Binary Face Classifier (`model_lite_gender_q.tflite`) Fed Non-Face / Full-Body Crops:**
+   - Inspection of `app/src/main/assets/model_lite_gender_q.tflite` confirms input `input_4` is `[1, 128, 128, 3]` and output `Identity` is `[1, 2]` (`[0] = Male`, `[1] = Female`). Because its 2-class softmax always sums to `1.0` (`maleProb + femaleProb == 1.0`) with **no background or non-face class**, passing full-screen bands (`0.12..0.88`) or torso/background crops into `GENDER_FILTER` produces arbitrary `Male`/`Female` probabilities on non-face regions.
+2. **Gender-Agnostic `sexy` Skin Score Overriding Target Gender:**
+   - In `ContentModerationEngine.classifyCropForHaramBlur()` (line 884), `nsfwConfidence` was set to `femaleScore`, and in `WebViewModerationBridge.kt` (line 454), `val shouldBlur = nsfwVerdict.isViolation || shouldBlurGender`.
+   - Because the 5-class `QUANTIZED_NSFW` model (`[0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy`) triggers `sexy` on **any** exposed skin (such as a shirtless man, male athlete, or male arms/chest), male exposed skin triggered `nsfwVerdict.isViolation` even when `Who to Blur = Female` and the detected face was `MALE`.
 
-> [!IMPORTANT]
-> The following product and UX choices were confirmed during Phase 1 clarification and are integrated into the architecture below:
+### C. LiteRT Inference & Frame-Processing Bottlenecks (Careful, Non-Destructive Optimization)
+1. **Per-Crop Direct ByteBuffer & Bitmap Allocations (`ContentModerationEngine.kt`):**
+   - `preprocessBitmap()` allocates a new `ByteBuffer.allocateDirect(...)`, `IntArray`, and scaled `Bitmap` on every crop (`9` to `16+` allocations per frame), causing GC pauses during continuous real-time scanning.
+2. **Redundant Double Inference on Safe Crops (`ContentModerationEngine.kt`, lines 501–526):**
+   - `classifySingleCropInternal()` runs a second full LiteRT `interpreter.run(...)` with `ALT_FLOAT` normalization whenever a crop is safe (`< threshold`), doubling inference time on every safe crop.
+3. **Synchronous Full-WebView UI-Thread Rasterization (`WebViewModerationBridge.kt`, lines 387–393):**
+   - Calling `webView.draw(canvas)` on a full-resolution `ARGB_8888` bitmap every `220ms` on `Dispatchers.Main` blocks scrolling in the In-App Protected Browser.
 
-- **Confirmed Decision 1 — 1,500ms Active Media & Video Heartbeat Scanner with Dashboard Toggle**:
-  - While an eligible browser or media app is in the foreground, the device screen is interactive (`PowerManager.isInteractive`), and the Curtain Shield is not visible, a periodic **1,500ms heartbeat scanner** captures frames so playing videos, Reels, GIFs, and stationary lightbox images are continuously evaluated even when the user is not scrolling.
-  - A dedicated **"Continuous Video & Media Heartbeat (1.5s)"** toggle is added to the Main Dashboard so users can enable or pause continuous video scanning at any time (enabled by default).
-- **Confirmed Decision 2 — Configurable Revealing (`sexy` 0.85x Weight) vs. Explicit-Only Scoring Toggle**:
-  - In the 5-class MobileNetV2 NSFW model (`[0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy`), a **"Include Revealing / Swimwear (`Sexy` Class)"** toggle is added to the Main Dashboard (enabled by default):
-    - When **enabled (Default)**: `combinedNsfwScore = pornProb + hentaiProb + (sexyProb * 0.85f)` and `finalScore = maxOf(pornProb + hentaiProb, combinedNsfwScore)`.
-    - When **disabled (Explicit-Only)**: `finalScore = pornProb + hentaiProb`.
-  - In both modes, if `neutralProb + drawingsProb > 0.78f` (such as a plain text webpage or settings screen), the frame is classified as **SAFE** to prevent UI chrome false positives.
-
----
-
-## 1. Overview & Core Concept
-
-- **What It Does**: Upgrades AmnGaze's Layer 2 on-device LiteRT vision engine from a single squished full-screen pass to a **3-crop aspect-ratio-preserving MobileNetV2 pipeline** paired with a **two-stage post-scroll scanner (`180ms` + `900ms`)** and a **1,500ms active video heartbeat**.
-- **Target Audience / Persona**: Users who rely on AmnGaze for real-time protection across web browsers, social feeds, image galleries, and short-form video players without suffering false triggers on text pages or Home Launchers.
-- **Key Value**:
-  1. Eliminates the MobileNetV2 preprocessing bug where VGG BGR mean subtraction (`B - 104, G - 117, R - 123`) corrupted `[0.0f, 1.0f]` RGB MobileNetV2 inputs.
-  2. Stops 9:20 tall-screen aspect-ratio squishing and browser chrome dilution by extracting **3 square `224x224` content crops** (Center, Upper-Middle, Lower-Middle).
-  3. Catches both **lazy-loaded web images** (`+900ms` follow-up scan after scroll settle) and **playing videos** (`1,500ms` heartbeat while screen is interactive).
-
----
-
-## 2. User Experience & Visual Design
-
-- **Key User Flows**:
-  1. **Scrolling Web & Social Feeds**: As the user scrolls a browser or social feed, the primary settle scan fires `180ms` after scrolling pauses, followed automatically by a `+900ms` verification scan to catch high-resolution images that finish downloading after the scroll stops.
-  2. **Watching Videos / Reels / Stationary Media**: When the user watches a video without touching the screen, the `1,500ms` heartbeat scanner evaluates frames in the background and immediately stops the instant the user switches to their Home Launcher (`com.alhaq.amniquist`), locks the screen, or leaves the eligible app.
-  3. **Dashboard Controls**: Inside the Main Dashboard's **3-Layer Pipeline & AI Vision** card, users can toggle:
-     - **Include Revealing / Swimwear (`Sexy` 0.85x Weight)** vs. **Explicit-Only (`Porn + Hentai`)**
-     - **Continuous Video & Media Heartbeat (1.5s)**
-     - **Detection Sensitivity Slider (`20%–95%`)** calibrated so `25% -> 0.62`, `50% -> 0.50`, `75% -> 0.38`, and `95% -> 0.28`.
-- **Visual Identity & Theme**:
-  - Preserves the user-selectable Material 3 themes (`Sunset Glow`, `Emerald Calm`, `Cosmic Night`) with clear status badges and tactile toggle cards.
+### D. Real-Time Regional Overlay Persistence Issues
+1. **Overlay Self-Occlusion in `MediaProjection` (`HaramBlurProjectionService.kt`):**
+   - Once `RegionalBlurOverlayView` draws over a detected face/body region, the next `MediaProjection` frame captures the *blur box itself* instead of the underlying face/skin.
+2. **Scroll Events Wiping All Regions (`AmnGazeAccessibilityService.kt` & `HaramBlurEngineLogic.kt`):**
+   - `TYPE_VIEW_SCROLLED` often reports `scrollDeltaY = 0f`, and `onScrollDetected(0f)` immediately executed `activeRegions.clear()`, causing overlays to blink off while scrolling.
 
 ---
 
-## 3. Key Product Decisions & Trade-Offs
+## 2. Planned Architecture & Surgical Changes
 
-- **Decision 1 — 3-Crop Aspect-Ratio Extraction vs. Single Full-Screen Downscale**:
-  - *Chosen Approach*: Copy the `HardwareBuffer` once into an aspect-ratio-preserving software `ARGB_8888` bitmap (width `360px`, proportional height `~760px`), immediately close `HardwareBuffer` in `finally`, and extract 3 square `224x224` crops from the active content zone (trimming the top 10% status/URL bar and bottom 10% navigation bar):
-    - **Crop 1 (Center Square)**: Centered vertically (`width x width`), evaluated first with immediate short-circuit if it exceeds the threshold.
-    - **Crop 2 (Upper-Middle Square)**: Covering `10%` to `55%` vertical height.
-    - **Crop 3 (Lower-Middle Square)**: Covering `45%` to `90%` vertical height.
-  - *Why*: Capturing a 9:20 phone screen and squishing it directly to `224x224` compresses vertical anatomy by >50% and fills half the tensor with safe UI chrome. Three square crops preserve 1:1 proportions and focus directly on feed images and video players.
-- **Decision 2 — Dynamic Tensor Inspection & RGB `[0.0f, 1.0f]` Normalization**:
-  - *Chosen Approach*: Inspect `interpreter.getInputTensor(0)` and `interpreter.getOutputTensor(0)` dynamically for shape, `DataType` (`FLOAT32` vs `UINT8`/`INT8`), and `quantizationParams`, feeding `[0.0f, 1.0f]` RGB floats for `FLOAT32` MobileNetV2 models and `0..255` RGB bytes for `UINT8` quantized models, while logging raw class probabilities via `Log.d("AmnGazeAI", ...)`.
-  - *Why*: Ensures both `amn_gaze.tflite` and `nsfw_mobilenet_v2_140_224_quantized.tflite` receive the exact tensor distribution they were trained on.
-- **Decision 3 — Dynamic `PackageManager` Browser Discovery + Expanded Media Package Set**:
-  - *Chosen Approach*: Query `PackageManager.queryIntentActivities(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.example.com")), PackageManager.MATCH_ALL)` at service startup to automatically register every installed browser on the user's phone, and expand `HIGH_RISK_MEDIA_PACKAGES` to include gallery, search, and social media apps (`googlequicksearchbox`, `apps.photos`, `gallery3d`, `miui.gallery`, `pinterest`, `tumblr`, `twitch`, `vkontakte`, `challegram`, `vivaldi`, `kiwibrowser`, `via`, `cromite`), while keeping all `CATEGORY_HOME` launchers (`com.alhaq.amniquist`, etc.) 100% immune.
+### Step 1: Effect Strength (`1..10`) Solidness vs. Transparency & Density Curve
+- **Files:** `HaramBlurEngineLogic.kt`, `RegionalBlurOverlayView.kt`, `WebViewModerationBridge.kt`, `HaramBlurDashboardSection.kt`, `InAppProtectionScreens.kt`, `AmnGazeViewModel.kt`
+- **Unified Solidness & Density Curve (`HaramBlurFilterLogic`):**
+  - Add `computeOverlayAlpha(effectStrength: Int): Int`:
+    - `1/10` → `alpha = 115` (`~45%` solidness — light translucent veil)
+    - `3/10` → `alpha = 158` (`~62%` solidness)
+    - `5/10` → `alpha = 198` (`~78%` solidness — medium dense blur)
+    - `7/10` → `alpha = 232` (`~91%` solidness — heavy dense blur)
+    - `8/10` → `alpha = 246` (`~96%` solidness)
+    - `9/10` → `alpha = 255` (`100%` solid opaque — zero see-through)
+    - `10/10` → `alpha = 255` (`100%` solid opaque + maximum layer/tile density — zero see-through)
+  - Add `computeDensityFactor(effectStrength: Int): Float` (`0.1f..1.0f`) to control internal layer count, frosted grid density, and pixelation tile packing density:
+    - **Blur (`BLUR`):** Base fill uses `computeOverlayAlpha(effectStrength)` (reaching `alpha = 255` solid opaque at `9..10/10`), plus dense multi-band frosted diffusion layers that scale with `effectStrength` so `9..10/10` is completely solid with zero see-through.
+    - **Pixelate (`PIXELATE`):** Base backing fill uses `computeOverlayAlpha(effectStrength)` (reaching `alpha = 255` at `9..10/10`), tile gaps shrink to `0f` at high intensity (`>= 8/10`), and tile alpha scales up to `255` so high strength produces a completely solid, dense mosaic with zero see-through.
+    - **Solid (`BLACK`, `GRAY`, `SKIN`):** Alpha scales smoothly via `computeOverlayAlpha(effectStrength)` from `115` (`1/10`) all the way to `255` (`9..10/10` 100% opaque solid cover).
+  - **In-App Browser Overlay Strength Sync (`WebViewModerationBridge.kt` & `AmnGazeViewModel.kt`):**
+    - Sync `updateHaramBlurEffectStrength(1..10)` and `updateInAppBlurStrengthPx(1..20)` so adjusting Effect Strength in either Dashboard or Settings updates both consistently.
+    - In `WebViewModerationBridge.applyOverlayStyle()`, scale both blur radius and solidness (contrasting/dimming backdrop opacity up to 100% opaque solid cover at `9..10/10` / `18..20px`) so high intensity leaves zero see-through silhouette.
+  - **UI Clarity (`HaramBlurDashboardSection.kt` & `InAppProtectionScreens.kt`):**
+    - Display the live solidness/density percentage alongside the `Effect Strength: X / 10` slider label (e.g., `Solidness: 100% (Solid)` at `9–10/10`).
+
+### Step 2: Strict Gender-Isolated Detection + Mandatory Pornography/Nudity Blurring
+- **Files:** `HaramBlurEngineLogic.kt`, `ContentModerationEngine.kt`, `WebViewModerationBridge.kt`
+- **Two-Tier Detection Policy (`HaramBlurFilterLogic` & `CandidateBlurBox`):**
+  1. **Mandatory Explicit Nudity / Pornography Rule (Always Active for Any Gender):**
+     - Hardcore pornography/hentai (`pornScore + hentaiScore` from 5-class `QUANTIZED_NSFW`, or high-confidence explicit nudity `>= 0.72f` from `DEFAULT_NSFW`) is **always** blurred regardless of whether `Who to Blur` is `Female`, `Male`, or `Both`.
+  2. **Gender-Specific Face, Figure & Exposed Skin Rule (`Female`, `Male`, `Both`):**
+     - Face crops (`128x128` aspect-preserved head regions) are evaluated by `GENDER_FILTER` (`model_lite_gender_q.tflite`) only when skin/face presence is verified, with a clear confidence margin (`>= 0.58f`) so background tiles are never misclassified as a face.
+     - Upper-body / torso / skin regions below or adjacent to a detected face inherit that person's verified gender (`FEMALE` or `MALE`).
+     - When `Who to Blur = Female`:
+       - Blurs detected **Female** faces, **Female** figures/bodies, and **Female** exposed skin (`sexy` / skin exposure score).
+       - If a subject's face is classified as `MALE` (and confidence is below the mandatory hardcore porn/explicit nudity ceiling), **neither** his face **nor** his body/exposed skin is blurred.
+     - When `Who to Blur = Male`:
+       - Blurs detected **Male** faces, **Male** figures/bodies, and **Male** exposed skin, while never blurring non-explicit `FEMALE` faces or skin.
+     - When `Who to Blur = Both`:
+       - Blurs both `FEMALE` and `MALE` faces, figures, and exposed skin regions.
+
+### Step 3: Careful, Non-Destructive LiteRT Pre-Processing & Tensor Reuse
+- **File:** `ContentModerationEngine.kt`
+- **Surgical Optimizations (Preserving All Public Signatures & Fallbacks):**
+  - Keep all existing public methods, model loading fallbacks, and tensor shape inspections intact.
+  - Replace per-crop allocations inside `preprocessBitmap()` with pre-allocated reusable buffers (`Canvas` + `Matrix` into a reusable target `Bitmap`, reusable `IntArray`, reusable direct `ByteBuffer` per model input size `128x128` and `224x224`, and a 256-entry `FLOAT_MINUS1_TO_1_LUT` lookup table) guarded by `inferenceLock`.
+  - Remove the redundant second `ALT_FLOAT` inference pass on crops that already scored clearly safe on the primary normalized pass.
+
+### Step 4: Real-Time Regional Tracking Without Self-Occlusion or Scroll Wipeouts
+- **Files:** `HaramBlurProjectionService.kt`, `HaramBlurEngineLogic.kt`, `AmnGazeAccessibilityService.kt`
+- **Unoccluded Reference Patch Restoration:**
+  - Before applying overlays on a newly captured frame, `HaramBlurProjectionService` caches the unblurred pixels under each active bounding box (`lastCleanFrameBitmap`). On the next capture cycle, if an active overlay covers a region, the clean underlying patch is composite-restored into the analysis copy if the surrounding border pixels haven't changed, preventing the overlay from blinding the detector while immediately detecting when the subject moves or leaves.
+- **Smooth Coordinate Tracking:**
+  - Replace `activeRegions.clear()` on `scrollDeltaY == 0f` with fast scan scheduling (`45ms` cadence during scroll) and smooth bounding-box interpolation (`lerp` `0.65f` new / `0.35f` previous when IoU `>= 0.25f`).
+
+### Step 5: Opt-In Setting to Pre-Blur / Hide Newly Appearing Media Until Scanned
+- **Files:** `AmnGazeState.kt`, `AmnGazeViewModel.kt`, `HaramBlurDashboardSection.kt`, `InAppProtectionScreens.kt`, `WebViewModerationBridge.kt`, `MainActivity.kt`
+- Add `preBlurNewMediaUntilScanned: Boolean = false` (persisted via `PREFS_KEY_PRE_BLUR_NEW_MEDIA`) to both System-Wide and In-App Settings so users can optionally pre-blur newly appearing `<img>`/`<video>` elements and incoming transitions until the AI scan confirms they are safe.
 
 ---
 
-## 4. Technical Architecture & Data Strategy *(Technical Reference)*
-
-### Architecture & Multi-Crop Vision Pipeline Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     AmnGazeAccessibilityService (API 30+)                    │
-│                                                                              │
-│  ┌────────────────────────────┐  ┌───────────────────────┐  ┌─────────────┐  │
-│  │ Dynamic Package Discovery  │  │ Two-Stage Scroll Scan │  │ Video Media │  │
-│  │ - PackageManager HTTP/HTTPS│  │ - Stage 1: +180ms     │  │ Heartbeat   │  │
-│  │ - Expanded Gallery/Social  │  │ - Stage 2: +900ms     │  │ - Every 1.5s│  │
-│  │ - HOME Launcher Immunity   │  │   (Lazy-Load Catch)   │  │   if Active │  │
-│  └─────────────┬──────────────┘  └───────────┬───────────┘  └──────┬──────┘  │
-│                └─────────────────────────────┼─────────────────────┘         │
-│                                              ▼                               │
-│                     takeScreenshot() -> HardwareBuffer                       │
-└──────────────────────────────────────────────┬───────────────────────────────┘
-                                               │
-                                               ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         ContentModerationEngine                              │
-│                                                                              │
-│  1. Safe HardwareBuffer Copy -> Proportional ARGB_8888 (width=360px)         │
-│     (Close HardwareBuffer & recycle hwBitmap immediately in finally)         │
-│                                                                              │
-│  2. Multi-Crop Aspect-Ratio Extractor (Trim Top 10% & Bottom 10% Chrome):    │
-│     ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐   │
-│     │ Crop 1: Center 1:1 │  │ Crop 2: Upper 1:1  │  │ Crop 3: Lower 1:1  │   │
-│     │ (Short-Circuits if │─▶│ (10%..55% Height   │─▶│ (45%..90% Height   │   │
-│     │  >= Threshold)     │  │  Scaled to 224x224)│  │  Scaled to 224x224)│   │
-│     └────────────────────┘  └────────────────────┘  └────────────────────┘   │
-│                                                                              │
-│  3. Dynamic Tensor Inspection & Scoring:                                     │
-│     - FLOAT32 RGB [0.0f..1.0f] / UINT8 RGB [0..255] + QuantizationParams     │
-│     - 5-Class Scorer: Safe Guard if (neutral + drawings > 0.78f)             │
-│       Else max(porn + hentai, porn + hentai + sexy * 0.85f)                  │
-│     - Calibrated Threshold: 25% -> 0.62f | 50% -> 0.50f | 75% -> 0.38f       │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Model & State Mapping
-- **`AmnGazeState` & `SharedPreferences`**:
-  - `videoHeartbeatEnabled: Boolean = true` (`PREFS_KEY_VIDEO_HEARTBEAT = "video_heartbeat_enabled"`)
-  - `includeSexyInNsfwScore: Boolean = true` (`PREFS_KEY_INCLUDE_SEXY_SCORE = "include_sexy_score_enabled"`)
-- **Calibrated Threshold Formula (`confidenceThresholdForSensitivity`)**:
-  - Linear piecewise/smooth mapping across `sensitivity in 0.20f..0.95f`:
-    - `0.25f -> 0.62f`
-    - `0.50f -> 0.50f`
-    - `0.75f -> 0.38f`
-    - `0.95f -> 0.28f`
-    - Formula: `(0.74f - (clamped * 0.48f)).coerceIn(0.28f, 0.65f)` (at `0.25` -> `0.62f`, at `0.50` -> `0.50f`, at `0.75` -> `0.38f`, at `0.95` -> `0.284f`).
-- **Verification Gate**:
-  - Unit & Robolectric tests in `AmnGazeLogicTest.kt` covering:
-    1. 5-class probability scorer with `sexy [4]` (`0.85f` weight) and `neutral [2] + drawings [0] > 0.78f` safe guard.
-    2. Sensitivity slider mapping (`25% -> ~0.62f`, `50% -> ~0.50f`, `75% -> ~0.38f`, `95% -> ~0.28f`).
-    3. Multi-crop extractor generating 3 valid `224x224` square crops from a tall `1080x2400` portrait bitmap without out-of-bounds errors.
+## 3. Verification Plan
+1. **Unit & Logic Tests (`AmnGazeLogicTest.kt`):**
+   - Verify `HaramBlurFilterLogic.computeOverlayAlpha(1..10)` scales from translucent (`115` at `1/10`) to **100% solid opaque (`255` at `9/10` and `10/10`)**.
+   - Verify gender isolation: when `targetGender = FEMALE`, a `MALE` subject with exposed skin (`revealingSkinConfidence = 0.70f`, `explicitPornNudityConfidence = 0.10f`) returns `shouldBlur = false`, while a `FEMALE` subject returns `shouldBlur = true`, and hardcore explicit nudity (`explicitPornNudityConfidence = 0.85f`) returns `shouldBlur = true` for any gender.
+   - Verify `AntiFlickerRegionTracker` does not wipe regions on `scrollDeltaY = 0f` and smoothly tracks moving boxes.
+2. **Build & Test Execution:**
+   - Run `gradle :app:testDebugUnitTest` and `compile_applet` to ensure zero build or runtime regressions.

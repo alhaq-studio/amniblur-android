@@ -91,7 +91,10 @@ class ContentModerationEngine(private val context: Context) {
             val sexyProb = probabilities[4].coerceIn(0f, 1f)
 
             // Safe UI / text screen guard
-            if ((neutralProb + drawingsProb) > SAFE_UI_NEUTRAL_DRAWINGS_THRESHOLD) {
+            if ((neutralProb + drawingsProb) > SAFE_UI_NEUTRAL_DRAWINGS_THRESHOLD &&
+                pornProb < 0.25f &&
+                hentaiProb < 0.25f
+            ) {
                 return 0.0f
             }
 
@@ -105,11 +108,16 @@ class ContentModerationEngine(private val context: Context) {
         }
 
         /**
-         * Extracts 3 square `targetSize x targetSize` (default `224x224`) crops from a portrait or landscape
-         * screen bitmap after trimming the top 10% status/URL bar and bottom 10% navigation bar:
-         * 1. Crop 1 (Center Square): Centered vertically on the screen (`width x width`).
-         * 2. Crop 2 (Upper-Middle Content Square): Covering the upper content feed area (`10%` to `55%` height).
-         * 3. Crop 3 (Lower-Middle Content Square): Covering the lower content feed area (`45%` to `90%` height).
+         * Extracts 3 square `targetSize x targetSize` (default `224x224`) crops from a portrait OR landscape
+         * screen bitmap after trimming the top/bottom or left/right 10% chrome bands:
+         * - Portrait (`h > w * 1.15f`):
+         *   1. Crop 1 (Center Square)
+         *   2. Crop 2 (Upper-Middle Content Square `10%..55%` height)
+         *   3. Crop 3 (Lower-Middle Content Square `45%..90%` height)
+         * - Landscape (`w > h * 1.15f`):
+         *   1. Crop 1 (Center Square)
+         *   2. Crop 2 (Left-Middle Content Square `10%..55%` width)
+         *   3. Crop 3 (Right-Middle Content Square `45%..90%` width)
          */
         fun extractMultiCrops(
             source: Bitmap,
@@ -119,7 +127,45 @@ class ContentModerationEngine(private val context: Context) {
             val h = source.height
             if (w <= 0 || h <= 0) return emptyList()
 
-            // If bitmap is landscape or nearly square, return a single center square crop
+            if (w > (h * 1.15f).roundToInt()) {
+                val activeLeft = (w * 0.10f).roundToInt().coerceIn(0, w - 1)
+                val activeRight = (w * 0.90f).roundToInt().coerceIn(activeLeft + 1, w)
+                val leftRegionEnd = (w * 0.55f).roundToInt().coerceIn(activeLeft + 1, activeRight)
+                val rightRegionStart = (w * 0.45f).roundToInt().coerceIn(activeLeft, activeRight - 1)
+
+                val centerSide = minOf(w, h)
+                val centerX = ((w - centerSide) / 2).coerceIn(0, w - centerSide)
+
+                val leftBandWidth = (leftRegionEnd - activeLeft).coerceAtLeast(1)
+                val leftSide = minOf(h, leftBandWidth, w)
+                val leftX = (activeLeft + (leftBandWidth - leftSide) / 2).coerceIn(0, w - leftSide)
+                val leftY = ((h - leftSide) / 2).coerceIn(0, h - leftSide)
+
+                val rightBandWidth = (activeRight - rightRegionStart).coerceAtLeast(1)
+                val rightSide = minOf(h, rightBandWidth, w)
+                val rightX = (rightRegionStart + (rightBandWidth - rightSide) / 2).coerceIn(0, w - rightSide)
+                val rightY = ((h - rightSide) / 2).coerceIn(0, h - rightSide)
+
+                val landscapeSpecs = listOf(
+                    Triple(centerX, 0, centerSide),
+                    Triple(leftX, leftY, leftSide),
+                    Triple(rightX, rightY, rightSide)
+                )
+                return landscapeSpecs.map { (cx, cy, side) ->
+                    val safeX = cx.coerceIn(0, (w - 1).coerceAtLeast(0))
+                    val safeY = cy.coerceIn(0, (h - 1).coerceAtLeast(0))
+                    val safeSide = side.coerceIn(1, minOf(w - safeX, h - safeY))
+                    val rawCrop = Bitmap.createBitmap(source, safeX, safeY, safeSide, safeSide)
+                    if (rawCrop.width == targetSize && rawCrop.height == targetSize) {
+                        rawCrop
+                    } else {
+                        val s = Bitmap.createScaledBitmap(rawCrop, targetSize, targetSize, true)
+                        if (s !== rawCrop) rawCrop.recycle()
+                        s
+                    }
+                }
+            }
+
             if (h <= (w * 1.15f).roundToInt()) {
                 val side = minOf(w, h)
                 val x = ((w - side) / 2).coerceAtLeast(0)
@@ -179,20 +225,40 @@ class ContentModerationEngine(private val context: Context) {
             }
             return crops
         }
+
+        /**
+         * Returns `true` only on physical hardware devices that expose a readable DRM render node
+         * (`/dev/dri/renderD128`) and are not running on a virtual/emulator Goldfish/Cuttlefish GPU.
+         * Prevents `E/platform: Failed to open rendernode: No such file or directory`.
+         */
+        fun hasRenderNodeSupport(): Boolean {
+            val isEmulator = Build.FINGERPRINT.startsWith("generic") ||
+                Build.FINGERPRINT.lowercase().contains("emulator") ||
+                Build.FINGERPRINT.lowercase().contains("sdk_gphone") ||
+                Build.MODEL.contains("google_sdk") ||
+                Build.MODEL.contains("Emulator") ||
+                Build.MODEL.contains("Android SDK built for") ||
+                Build.HARDWARE.contains("goldfish") ||
+                Build.HARDWARE.contains("ranchu") ||
+                Build.HARDWARE.contains("cutf") ||
+                Build.PRODUCT.contains("sdk_gphone") ||
+                Build.PRODUCT.contains("emulator")
+            if (isEmulator) return false
+            return try {
+                val renderNode = java.io.File("/dev/dri/renderD128")
+                renderNode.exists() && renderNode.canRead()
+            } catch (_: Throwable) {
+                false
+            }
+        }
     }
 
-    private var interpreter: Interpreter? = null
-    private var gpuDelegate: GpuDelegate? = null
-    private var loadedModelType: ModerationModelType? = null
-
-    init {
-        reloadModel(ModerationModelType.DEFAULT_NSFW)
-    }
+    private val interpreters = java.util.EnumMap<ModerationModelType, Interpreter>(ModerationModelType::class.java)
+    private val gpuDelegates = java.util.EnumMap<ModerationModelType, GpuDelegate>(ModerationModelType::class.java)
 
     @Synchronized
-    private fun reloadModel(modelType: ModerationModelType) {
-        Log.i(TAG, "Switching/reloading LiteRT model to: $modelType")
-        close()
+    private fun getOrLoadInterpreter(modelType: ModerationModelType): Interpreter? {
+        interpreters[modelType]?.let { return it }
 
         val modelFileName = when (modelType) {
             ModerationModelType.DEFAULT_NSFW -> "amn_gaze.tflite"
@@ -200,43 +266,45 @@ class ContentModerationEngine(private val context: Context) {
             ModerationModelType.GENDER_FILTER -> "model_lite_gender_q.tflite"
         }
 
-        val modelBuffer = loadModelFile(context, modelFileName)
-        if (modelBuffer != null) {
+        val modelBuffer = loadModelFile(context, modelFileName) ?: return null
+
+        // Only attempt GpuDelegate on float models when physical DRM renderD128 support is verified
+        val allowGpuDelegate = (modelType == ModerationModelType.DEFAULT_NSFW) && hasRenderNodeSupport()
+        if (allowGpuDelegate) {
             try {
-                val options = Interpreter.Options()
-                gpuDelegate = GpuDelegate()
-                options.addDelegate(gpuDelegate)
-                interpreter = Interpreter(modelBuffer, options)
-                loadedModelType = modelType
-                logModelTensorDetails(modelFileName, "GPU")
+                val delegate = GpuDelegate()
+                val options = Interpreter.Options().apply {
+                    addDelegate(delegate)
+                }
+                val interp = Interpreter(modelBuffer, options)
+                gpuDelegates[modelType] = delegate
+                interpreters[modelType] = interp
+                logModelTensorDetails(interp, modelFileName, "GPU")
+                return interp
             } catch (e: Throwable) {
                 Log.w(TAG, "GPU delegate unavailable for $modelFileName; falling back to multi-thread CPU.", e)
                 try {
-                    gpuDelegate?.close()
+                    gpuDelegates.remove(modelType)?.close()
                 } catch (_: Throwable) {
                 }
-                gpuDelegate = null
-                try {
-                    val cpuOptions = Interpreter.Options().apply {
-                        setNumThreads(4)
-                    }
-                    interpreter = Interpreter(modelBuffer, cpuOptions)
-                    loadedModelType = modelType
-                    logModelTensorDetails(modelFileName, "CPU-4T")
-                } catch (ex: Throwable) {
-                    Log.e(TAG, "Failed to initialize LiteRT Interpreter on CPU for $modelFileName", ex)
-                    interpreter = null
-                    loadedModelType = null
-                }
             }
-        } else {
-            interpreter = null
-            loadedModelType = null
+        }
+
+        return try {
+            val cpuOptions = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
+            val interp = Interpreter(modelBuffer, cpuOptions)
+            interpreters[modelType] = interp
+            logModelTensorDetails(interp, modelFileName, "CPU-4T")
+            interp
+        } catch (ex: Throwable) {
+            Log.e(TAG, "Failed to initialize LiteRT Interpreter on CPU for $modelFileName", ex)
+            null
         }
     }
 
-    private fun logModelTensorDetails(modelFileName: String, backend: String) {
-        val interp = interpreter ?: return
+    private fun logModelTensorDetails(interp: Interpreter, modelFileName: String, backend: String) {
         try {
             val inTensor = interp.getInputTensor(0)
             val outTensor = interp.getOutputTensor(0)
@@ -368,7 +436,7 @@ class ContentModerationEngine(private val context: Context) {
         includeSexyScore: Boolean = true
     ): VisionVerdict {
         var hwBitmap: Bitmap? = null
-        var proportionalHwBitmap: Bitmap? = null
+        var fullSoftBitmap: Bitmap? = null
         var softwareBitmap: Bitmap? = null
 
         try {
@@ -379,20 +447,28 @@ class ContentModerationEngine(private val context: Context) {
                 val targetHeight = ((hwBitmap.height.toFloat() / hwBitmap.width.toFloat()) * targetWidth)
                     .roundToInt()
                     .coerceAtLeast(DEFAULT_INPUT_SIZE)
-                proportionalHwBitmap = Bitmap.createScaledBitmap(
-                    hwBitmap,
-                    targetWidth,
-                    targetHeight,
-                    true
-                )
-                softwareBitmap = proportionalHwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                // Copy HARDWARE bitmap to software ARGB_8888 BEFORE scaling so background thread
+                // never invokes HardwareRenderer / DRM rendernode for scaling
+                fullSoftBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                if (fullSoftBitmap != null) {
+                    softwareBitmap = if (fullSoftBitmap.width == targetWidth && fullSoftBitmap.height == targetHeight) {
+                        fullSoftBitmap
+                    } else {
+                        Bitmap.createScaledBitmap(
+                            fullSoftBitmap,
+                            targetWidth,
+                            targetHeight,
+                            true
+                        )
+                    }
+                }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to copy HardwareBuffer to proportional software ARGB_8888 bitmap.", t)
         } finally {
             try {
-                if (proportionalHwBitmap != null && proportionalHwBitmap !== hwBitmap) {
-                    proportionalHwBitmap.recycle()
+                if (fullSoftBitmap != null && fullSoftBitmap !== softwareBitmap && !fullSoftBitmap.isRecycled) {
+                    fullSoftBitmap.recycle()
                 }
             } catch (_: Throwable) {
             }
@@ -444,11 +520,7 @@ class ContentModerationEngine(private val context: Context) {
         includeSexyScore: Boolean = true
     ): VisionVerdict {
         val threshold = confidenceThresholdForSensitivity(sensitivity)
-        if (loadedModelType != modelType || interpreter == null) {
-            reloadModel(modelType)
-        }
-
-        val interpreterInstance = interpreter
+        val interpreterInstance = getOrLoadInterpreter(modelType)
             ?: return VisionVerdict(
                 isViolation = false,
                 confidence = 0f,
@@ -515,12 +587,7 @@ class ContentModerationEngine(private val context: Context) {
         includeSexyScore: Boolean = true
     ): VisionVerdict {
         val threshold = confidenceThresholdForSensitivity(sensitivity)
-
-        if (loadedModelType != modelType || interpreter == null) {
-            reloadModel(modelType)
-        }
-
-        val interpreterInstance = interpreter
+        val interpreterInstance = getOrLoadInterpreter(modelType)
             ?: return VisionVerdict(
                 isViolation = false,
                 confidence = 0f,
@@ -683,16 +750,170 @@ class ContentModerationEngine(private val context: Context) {
         return probabilities
     }
 
+    /**
+     * Detects candidate face and figure bounding boxes in a downscaled `480p` frame and classifies
+     * each region using `model_lite_gender_q.tflite` (plus NSFW/revealing score).
+     */
+    @Synchronized
+    fun detectRegionalBlurCandidates(
+        frameBitmap: Bitmap
+    ): List<CandidateBlurBox> {
+        val w = frameBitmap.width
+        val h = frameBitmap.height
+        if (w <= 16 || h <= 16) return emptyList()
+
+        val candidateRects = mutableListOf<android.graphics.RectF>()
+
+        // 1. Hardware/Software Android FaceDetector pass on RGB_565 copy for fast face localization
+        var rgb565: Bitmap? = null
+        try {
+            rgb565 = frameBitmap.copy(Bitmap.Config.RGB_565, false)
+            if (rgb565 != null) {
+                val maxFaces = 5
+                val faces = arrayOfNulls<android.media.FaceDetector.Face>(maxFaces)
+                val detector = android.media.FaceDetector(rgb565.width, rgb565.height, maxFaces)
+                val found = detector.findFaces(rgb565, faces)
+                val midPoint = android.graphics.PointF()
+                for (i in 0 until found) {
+                    val face = faces[i] ?: continue
+                    if (face.confidence() >= 0.30f) {
+                        face.getMidPoint(midPoint)
+                        val eyeDist = face.eyesDistance().coerceAtLeast(16f)
+                        val halfW = eyeDist * 1.45f
+                        val halfH = eyeDist * 1.85f
+                        val left = ((midPoint.x - halfW) / w.toFloat()).coerceIn(0f, 1f)
+                        val top = ((midPoint.y - halfH) / h.toFloat()).coerceIn(0f, 1f)
+                        val right = ((midPoint.x + halfW) / w.toFloat()).coerceIn(0f, 1f)
+                        val bottom = ((midPoint.y + halfH) / h.toFloat()).coerceIn(0f, 1f)
+                        if (right - left > 0.04f && bottom - top > 0.04f) {
+                            candidateRects.add(android.graphics.RectF(left, top, right, bottom))
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        } finally {
+            try {
+                rgb565?.recycle()
+            } catch (_: Throwable) {
+            }
+        }
+
+        // 2. If no explicit face landmarks were returned, evaluate the 3 active content bands
+        //    (Upper-Middle, Center, Lower-Middle) so figures/portraits are still caught
+        if (candidateRects.isEmpty()) {
+            candidateRects.add(android.graphics.RectF(0.12f, 0.14f, 0.88f, 0.52f))
+            candidateRects.add(android.graphics.RectF(0.12f, 0.32f, 0.88f, 0.70f))
+            candidateRects.add(android.graphics.RectF(0.12f, 0.50f, 0.88f, 0.88f))
+        }
+
+        val results = mutableListOf<CandidateBlurBox>()
+        for (normRect in candidateRects) {
+            val cropLeft = (normRect.left * w).toInt().coerceIn(0, w - 2)
+            val cropTop = (normRect.top * h).toInt().coerceIn(0, h - 2)
+            val cropWidth = ((normRect.right - normRect.left) * w).toInt().coerceIn(1, w - cropLeft)
+            val cropHeight = ((normRect.bottom - normRect.top) * h).toInt().coerceIn(1, h - cropTop)
+            var subCrop: Bitmap? = null
+            try {
+                subCrop = Bitmap.createBitmap(frameBitmap, cropLeft, cropTop, cropWidth, cropHeight)
+                results.add(classifyCropForHaramBlur(subCrop, normRect))
+            } catch (_: Throwable) {
+            } finally {
+                try {
+                    if (subCrop != null && subCrop !== frameBitmap && !subCrop.isRecycled) {
+                        subCrop.recycle()
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        return results
+    }
+
+    /**
+     * Classifies a single face/figure crop using `model_lite_gender_q.tflite` (`GENDER_FILTER`)
+     * and returns a [CandidateBlurBox] with gender (`FEMALE` / `MALE`) and confidence.
+     */
+    @Synchronized
+    fun classifyCropForHaramBlur(
+        cropBitmap: Bitmap,
+        normalizedRect: android.graphics.RectF = android.graphics.RectF(0f, 0f, 1f, 1f)
+    ): CandidateBlurBox {
+        val interp = getOrLoadInterpreter(ModerationModelType.GENDER_FILTER)
+            ?: return CandidateBlurBox(
+                normalizedRect = normalizedRect,
+                gender = DetectedGender.UNKNOWN,
+                genderConfidence = 0f,
+                nsfwConfidence = 0f
+            )
+
+        return try {
+            val inTensor = interp.getInputTensor(0)
+            val inShape = inTensor.shape()
+            val inputSize = if (inShape.size >= 3 && inShape[1] > 0) inShape[1] else DEFAULT_INPUT_SIZE
+            val inType = inTensor.dataType()
+            val inQ = inTensor.quantizationParams()
+            val outTensor = interp.getOutputTensor(0)
+            val outType = outTensor.dataType()
+            val outShape = outTensor.shape()
+            val numClasses = if (outShape.size >= 2 && outShape[1] > 0) outShape[1] else 2
+
+            val probs = runInferencePass(
+                interpreterInstance = interp,
+                cropBitmap = cropBitmap,
+                inputSize = inputSize,
+                inputDataType = inType,
+                inputScale = inQ.scale,
+                inputZeroPoint = inQ.zeroPoint,
+                outputTensor = outTensor,
+                outputDataType = outType,
+                numClasses = numClasses,
+                useMinusOneToOneRange = false
+            )
+
+            // Standard 2-class gender model: index 0 = Male / Neutral, index 1 = Female (or vice versa)
+            val femaleScore = if (probs.size >= 2) probs[1].coerceIn(0f, 1f) else probs.getOrElse(0) { 0f }
+            val maleScore = if (probs.size >= 2) probs[0].coerceIn(0f, 1f) else (1f - femaleScore).coerceIn(0f, 1f)
+            val gender = if (femaleScore >= maleScore) DetectedGender.FEMALE else DetectedGender.MALE
+            val genderConf = maxOf(femaleScore, maleScore)
+
+            CandidateBlurBox(
+                normalizedRect = normalizedRect,
+                gender = gender,
+                genderConfidence = genderConf,
+                nsfwConfidence = femaleScore
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to classify HaramBlur crop", t)
+            CandidateBlurBox(
+                normalizedRect = normalizedRect,
+                gender = DetectedGender.UNKNOWN,
+                genderConfidence = 0f,
+                nsfwConfidence = 0f
+            )
+        }
+    }
+
     @Synchronized
     fun close() {
         try {
-            interpreter?.close()
-            gpuDelegate?.close()
+            for (interp in interpreters.values) {
+                try {
+                    interp.close()
+                } catch (_: Throwable) {
+                }
+            }
+            for (delegate in gpuDelegates.values) {
+                try {
+                    delegate.close()
+                } catch (_: Throwable) {
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing LiteRT resources.", e)
         } finally {
-            interpreter = null
-            gpuDelegate = null
+            interpreters.clear()
+            gpuDelegates.clear()
         }
     }
 }

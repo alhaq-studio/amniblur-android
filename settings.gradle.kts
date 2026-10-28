@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "AmnGaze"
+rootProject.name = "AmnGaze Content blocker"
 
 include(":app")

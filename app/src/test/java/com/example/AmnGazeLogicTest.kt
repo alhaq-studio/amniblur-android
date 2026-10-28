@@ -306,4 +306,323 @@ class AmnGazeLogicTest {
             )
         )
     }
+
+    @Test
+    fun testMultiCropExtractorOnWideLandscapeBitmap() {
+        val wideBitmap = android.graphics.Bitmap.createBitmap(
+            2400,
+            1080,
+            android.graphics.Bitmap.Config.ARGB_8888
+        )
+        try {
+            val crops = ContentModerationEngine.extractMultiCrops(wideBitmap, targetSize = 224)
+            assertEquals(3, crops.size)
+            for (crop in crops) {
+                assertFalse(crop.isRecycled)
+                assertEquals(224, crop.width)
+                assertEquals(224, crop.height)
+                crop.recycle()
+            }
+        } finally {
+            wideBitmap.recycle()
+        }
+    }
+
+    @Test
+    fun testMasterTogglesAndDropdownStateIsolation() = runBlocking {
+        // Initially Module 1 is enabled & expanded; Module 2 (HaramBlur) is disabled & collapsed
+        val initial = viewModel.state.first()
+        assertTrue(initial.isExplicitBlockerEnabled)
+        assertTrue(initial.isExplicitSettingsExpanded)
+        assertFalse(initial.isHaramBlurEnabled)
+        assertFalse(initial.isHaramBlurSettingsExpanded)
+
+        // Toggling Module 2 ON expands Module 2 settings without mutating Module 1 state
+        viewModel.setHaramBlurEnabled(true)
+        viewModel.updateHaramBlurTargetGender(HaramBlurTargetGender.BOTH)
+        viewModel.updateHaramBlurSensitivity(HaramBlurSensitivity.HIGH)
+        viewModel.updateHaramBlurOverlayStyle(HaramBlurOverlayStyle.PIXELATE)
+        viewModel.updateHaramBlurEffectStrength(9)
+
+        val afterHaramBlurOn = viewModel.state.first()
+        assertTrue(afterHaramBlurOn.isHaramBlurEnabled)
+        assertTrue(afterHaramBlurOn.isHaramBlurSettingsExpanded)
+        assertEquals(HaramBlurTargetGender.BOTH, afterHaramBlurOn.haramBlurTargetGender)
+        assertEquals(HaramBlurSensitivity.HIGH, afterHaramBlurOn.haramBlurSensitivity)
+        assertEquals(HaramBlurOverlayStyle.PIXELATE, afterHaramBlurOn.haramBlurOverlayStyle)
+        assertEquals(9, afterHaramBlurOn.haramBlurEffectStrength)
+        // Module 1 remains completely untouched
+        assertTrue(afterHaramBlurOn.isExplicitBlockerEnabled)
+        assertEquals(EnforcementMode.CURTAIN_SHIELD, afterHaramBlurOn.enforcementMode)
+
+        // Toggling Module 1 OFF collapses Module 1 settings without turning off Module 2
+        viewModel.setExplicitBlockerEnabled(false)
+        val afterExplicitOff = viewModel.state.first()
+        assertFalse(afterExplicitOff.isExplicitBlockerEnabled)
+        assertFalse(afterExplicitOff.isExplicitSettingsExpanded)
+        assertTrue(afterExplicitOff.isHaramBlurEnabled)
+        assertTrue(afterExplicitOff.isHaramBlurSettingsExpanded)
+    }
+
+    @Test
+    fun testHaramBlurFilterLogicAndEffectStrengthScaling() {
+        // Sensitivity thresholds
+        assertEquals(0.70f, HaramBlurSensitivity.LOW.threshold, 0.001f)
+        assertEquals(0.52f, HaramBlurSensitivity.MEDIUM.threshold, 0.001f)
+        assertEquals(0.35f, HaramBlurSensitivity.HIGH.threshold, 0.001f)
+
+        // Effect strength 1..10 -> 8dp..36dp pixelation block size, 6px..42px blur radius
+        assertEquals(8f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.1f)
+        assertEquals(36f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.1f)
+        assertEquals(6f, HaramBlurFilterLogic.computeBlurRadiusPx(1), 0.1f)
+        assertEquals(42f, HaramBlurFilterLogic.computeBlurRadiusPx(10), 0.1f)
+
+        // Target gender matching (FEMALE only vs MALE only vs BOTH)
+        val femaleCandidate = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.2f, 0.6f, 0.6f),
+            gender = DetectedGender.FEMALE,
+            genderConfidence = 0.82f,
+            nsfwConfidence = 0.20f
+        )
+        val maleCandidate = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.2f, 0.6f, 0.6f),
+            gender = DetectedGender.MALE,
+            genderConfidence = 0.85f,
+            nsfwConfidence = 0.10f
+        )
+
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = femaleCandidate,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertFalse(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = femaleCandidate,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleCandidate,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleCandidate,
+                targetGender = HaramBlurTargetGender.BOTH,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+    }
+
+    @Test
+    fun testAntiFlickerRegionTrackerPreventsSelfOcclusionUnblurAndClearsOnScroll() {
+        val tracker = AntiFlickerRegionTracker(
+            stationaryExteriorDiffThreshold = 0.04f,
+            ttlMs = 350L
+        )
+
+        val candidate = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.20f, 0.25f, 0.80f, 0.75f),
+            gender = DetectedGender.FEMALE,
+            genderConfidence = 0.88f,
+            nsfwConfidence = 0.25f
+        )
+
+        // Frame 1 at t=1000ms: candidate detected -> 1 active region
+        val frame1Regions = tracker.updateRegions(
+            candidates = listOf(candidate),
+            exteriorDiff = 0.20f,
+            scrollOccurred = false,
+            nowMs = 1_000L,
+            targetGender = HaramBlurTargetGender.FEMALE,
+            sensitivity = HaramBlurSensitivity.MEDIUM
+        )
+        assertEquals(1, frame1Regions.size)
+
+        // Frame 2 at t=1500ms (past 350ms TTL): MediaProjection captures its own blur box so
+        // candidates is empty, BUT exterior pixels outside the blur box are stationary (exteriorDiff = 0.01f < 0.04f).
+        // The region MUST remain locked with zero flicker!
+        val frame2Regions = tracker.updateRegions(
+            candidates = emptyList(),
+            exteriorDiff = 0.01f,
+            scrollOccurred = false,
+            nowMs = 1_500L,
+            targetGender = HaramBlurTargetGender.FEMALE,
+            sensitivity = HaramBlurSensitivity.MEDIUM
+        )
+        assertEquals(1, frame2Regions.size)
+        assertTrue(frame2Regions[0].rectF.left <= 0.20f)
+
+        // Frame 3 at t=1900ms: User scrolls / switches page so exterior pixels change significantly (exteriorDiff = 0.35f > 0.04f)
+        val frame3Regions = tracker.updateRegions(
+            candidates = emptyList(),
+            exteriorDiff = 0.35f,
+            scrollOccurred = false,
+            nowMs = 1_900L,
+            targetGender = HaramBlurTargetGender.FEMALE,
+            sensitivity = HaramBlurSensitivity.MEDIUM
+        )
+        assertTrue(frame3Regions.isEmpty())
+
+        // Also verify Accessibility TYPE_VIEW_SCROLLED immediately clears active regions
+        tracker.updateRegions(
+            candidates = listOf(candidate),
+            exteriorDiff = 0.20f,
+            scrollOccurred = false,
+            nowMs = 2_000L,
+            targetGender = HaramBlurTargetGender.FEMALE,
+            sensitivity = HaramBlurSensitivity.MEDIUM
+        )
+        assertEquals(1, tracker.getActiveRegions().size)
+        tracker.onScrollDetected(0f)
+        assertTrue(tracker.getActiveRegions().isEmpty())
+    }
+
+    @Test
+    fun testAutoRunReminderControllerWithLauncherImmunity() {
+        val controller = AutoRunReminderController(reminderCooldownMs = 60_000L)
+        val autoRunApps = setOf("com.instagram.android", "com.alhaq.amniquist")
+
+        // Protected launcher (com.alhaq.amniquist) NEVER triggers auto-run reminder even if in set
+        assertFalse(
+            controller.shouldEmitAutoRunReminder(
+                foregroundPackage = "com.alhaq.amniquist",
+                autoRunPackages = autoRunApps,
+                isHaramBlurEnabled = false,
+                nowMs = 10_000L,
+                selfPackageName = "com.amngaze",
+                detectedHomePackages = setOf("com.alhaq.amniquist")
+            )
+        )
+
+        // Entering Instagram when HaramBlur is OFF triggers reminder once, then respects cooldown
+        assertTrue(
+            controller.shouldEmitAutoRunReminder(
+                foregroundPackage = "com.instagram.android",
+                autoRunPackages = autoRunApps,
+                isHaramBlurEnabled = false,
+                nowMs = 10_000L,
+                selfPackageName = "com.amngaze"
+            )
+        )
+        assertFalse(
+            controller.shouldEmitAutoRunReminder(
+                foregroundPackage = "com.instagram.android",
+                autoRunPackages = autoRunApps,
+                isHaramBlurEnabled = false,
+                nowMs = 30_000L,
+                selfPackageName = "com.amngaze"
+            )
+        )
+        assertTrue(
+            controller.shouldEmitAutoRunReminder(
+                foregroundPackage = "com.instagram.android",
+                autoRunPackages = autoRunApps,
+                isHaramBlurEnabled = false,
+                nowMs = 75_000L,
+                selfPackageName = "com.amngaze"
+            )
+        )
+    }
+
+    @Test
+    fun testDualProtectionModeConnectedPlatformsAndParentalPin() = runBlocking {
+        // Switch top-level mode to IN_APP_PROTECTION and verify persistence
+        viewModel.updateAppProtectionMode(AppProtectionMode.IN_APP_PROTECTION)
+        viewModel.addOrUpdateCustomPlatform("Reddit Mobile", "reddit.com")
+        viewModel.toggleConnectedPlatformEnabled("facebook")
+        assertTrue(viewModel.enableParentalPin("4826"))
+
+        val state = viewModel.state.first()
+        assertEquals(AppProtectionMode.IN_APP_PROTECTION, state.appProtectionMode)
+        assertTrue(state.connectedPlatforms.any { it.name == "Reddit Mobile" && it.url == "https://reddit.com" })
+        assertFalse(state.connectedPlatforms.first { it.id == "facebook" }.enabled)
+        assertTrue(state.parentalPinEnabled)
+        assertTrue(viewModel.verifyParentalPin("4826"))
+        assertFalse(viewModel.verifyParentalPin("0000"))
+
+        // Reload ViewModel from SharedPreferences and confirm persistence
+        val reloaded = AmnGazeViewModel(context as Application).state.first()
+        assertEquals(AppProtectionMode.IN_APP_PROTECTION, reloaded.appProtectionMode)
+        assertTrue(reloaded.connectedPlatforms.any { it.name == "Reddit Mobile" })
+        assertTrue(reloaded.parentalPinEnabled)
+    }
+
+    @Test
+    fun testWebViewModerationBridgeCoordinateMappingFeedCssAndTimeLimits() {
+        // 1. CSS rect -> 480px-wide bitmap rect mapping
+        val mediaItem = ViewportMediaItem(
+            id = "ag_m_1",
+            tagName = "IMG",
+            left = 90f,
+            top = 160f,
+            width = 180f,
+            height = 160f,
+            viewportWidth = 360f,
+            viewportHeight = 640f
+        )
+        val rect = WebViewModerationBridge.mapCssRectToBitmapRect(
+            item = mediaItem,
+            bitmapWidth = 480,
+            bitmapHeight = 853
+        )
+        assertNotNull(rect)
+        assertEquals(120, rect!!.left)
+        assertEquals(360, rect.right)
+
+        // 2. JSON batch parsing & verdict serialization
+        val batchJson = """
+            [{"id":"ag_m_1","tag":"img","left":10,"top":20,"width":200,"height":200,"vw":360,"vh":640}]
+        """.trimIndent()
+        val parsed = WebViewModerationBridge.parseVisibleMediaBatchJson(batchJson)
+        assertEquals(1, parsed.size)
+        assertEquals("ag_m_1", parsed[0].id)
+
+        val verdictsJson = WebViewModerationBridge.buildVerdictsJson(
+            verdicts = listOf(MediaVerdict(id = "ag_m_1", shouldBlur = true, reason = "NSFW", confidence = 0.91f)),
+            style = HaramBlurOverlayStyle.BLUR,
+            strengthPx = 12
+        )
+        assertTrue(verdictsJson.contains("\"blur\":true"))
+        assertTrue(verdictsJson.contains("\"style\":\"BLUR\""))
+
+        // 3. Feed Control CSS generation hides Shorts, Reels, Algorithmic Feeds & Comments
+        val css = WebViewModerationBridge.generateFeedControlCss(
+            FeedControlConfig(
+                hideYoutubeShorts = true,
+                hideInstagramReels = true,
+                hideAlgorithmicFeeds = true,
+                hideComments = true
+            )
+        )
+        assertTrue(css.contains("ytd-reel-shelf-renderer"))
+        assertTrue(css.contains("a[href*=\"/reels/\"]"))
+        assertTrue(css.contains("a[href*=\"/explore/\"]"))
+
+        // 4. Daily platform usage limit tracker
+        val usageMap = mapOf("youtube" to 15 * 60)
+        assertFalse(
+            PlatformUsageTracker.isDailyLimitReached(
+                platformId = "youtube",
+                dailyLimitMinutes = 20,
+                usageSecondsMap = usageMap
+            )
+        )
+        assertTrue(
+            PlatformUsageTracker.isDailyLimitReached(
+                platformId = "youtube",
+                dailyLimitMinutes = 15,
+                usageSecondsMap = usageMap
+            )
+        )
+    }
 }
+
+

@@ -286,6 +286,10 @@ class AmnGazeAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val rawEventPkg = event?.packageName?.toString() ?: return
 
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            HaramBlurRuntimeBus.onScrollDetected(0f)
+        }
+
         // Ignore Accessibility events emitted by our own overlay window so we never self-trigger
         if (rawEventPkg == packageName && overlayManager.isShieldVisible) {
             val activeWindowPkg = try {
@@ -302,9 +306,16 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         handleForegroundPackageObservation(rawEventPkg, event.eventType)
     }
 
+    private val autoRunReminderController = AutoRunReminderController()
+
     private fun handleForegroundPackageObservation(pkg: String, eventType: Int) {
-        if (!FastPathUrlAndKeywordScanner.isTransientInputMethodOverlay(pkg)) {
+        val isTransientIme = FastPathUrlAndKeywordScanner.isTransientInputMethodOverlay(pkg)
+        if (!isTransientIme) {
             activeForegroundPackage = pkg
+            HaramBlurRuntimeBus.onForegroundPackageChanged(
+                packageName = pkg,
+                isIgnoredLauncherOrSystem = isIgnoredSystemOrSelfPackage(pkg)
+            )
         }
 
         // 1. CRITICAL: Immediately remove the overlay whenever the user is outside the app that triggered it!
@@ -321,10 +332,42 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             overlayManager.hide()
         }
 
+        val now = SystemClock.elapsedRealtime()
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        // Check HaramBlur Auto-Run reminder when a window state changes to a user-selected app
+        if (!isTransientIme && eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val isHaramBlurRunning = HaramBlurRuntimeBus.isProjectionRunning.value ||
+                prefs.getBoolean(PREFS_KEY_HARAMBLUR_ENABLED, false)
+            val rawAutoRun = prefs.getString(PREFS_KEY_HARAMBLUR_AUTO_RUN_PACKAGES, "") ?: ""
+            val autoRunSet = rawAutoRun.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            if (autoRunReminderController.shouldEmitAutoRunReminder(
+                    foregroundPackage = pkg,
+                    autoRunPackages = autoRunSet,
+                    isHaramBlurEnabled = isHaramBlurRunning,
+                    nowMs = now,
+                    selfPackageName = packageName,
+                    detectedHomePackages = detectedHomePackages
+                )
+            ) {
+                HaramBlurRuntimeBus.postAutoRunReminder(pkg)
+            }
+        }
+
+        // Check Master Toggle 1 (isExplicitBlockerEnabled): if OFF, pause Module 1 scanning & hide Curtain Shield
+        val isExplicitBlockerEnabled = prefs.getBoolean(PREFS_KEY_EXPLICIT_BLOCKER_ENABLED, true)
+        if (!isExplicitBlockerEnabled) {
+            stopAllVisualScanTimers()
+            if (overlayManager.isShieldVisible) {
+                overlayManager.hide()
+            }
+            return
+        }
+
         // 2. Never scan, lock, or show an overlay on Home Launchers (com.alhaq.amniquist, etc.),
         //    SystemUI, Settings, Keyboards, or any non-monitored app.
         if (isIgnoredSystemOrSelfPackage(pkg) || !isEligibleForVisualScan(pkg)) {
-            if (!FastPathUrlAndKeywordScanner.isTransientInputMethodOverlay(pkg)) {
+            if (!isTransientIme) {
                 stopAllVisualScanTimers()
                 if (overlayManager.isShieldVisible) {
                     overlayManager.hide()
@@ -333,8 +376,6 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             return
         }
 
-        val now = SystemClock.elapsedRealtime()
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val enforcementMode = EnforcementMode.entries.getOrElse(
             prefs.getInt(PREFS_KEY_ENFORCEMENT_MODE, EnforcementMode.CURTAIN_SHIELD.ordinal)
         ) { EnforcementMode.CURTAIN_SHIELD }
@@ -634,6 +675,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         ) { EnforcementMode.CURTAIN_SHIELD }
         val showBadge = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BADGE, true)
         val showBorder = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BORDER, true)
+        val parentalPinEnabled = prefs.getBoolean(PREFS_KEY_PARENTAL_PIN_ENABLED, false)
 
         if (enforcementMode == EnforcementMode.CURTAIN_SHIELD) {
             // Curtain Shield Mode: App-scoped overlay with 30-second unblur window; NO 3-strike 15m lockout
@@ -645,7 +687,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
                 title = "Explicit or Triggering Content Blocked",
                 reason = reasonDescription,
                 strikeStatus = "App: $packageName | Category: $categoryName",
-                allowFalsePositiveUnblur = true,
+                allowFalsePositiveUnblur = !parentalPinEnabled,
                 primaryActionLabel = "Leave Page Safely",
                 secondaryActionLabel = "Unblur App for 30s"
             )
@@ -669,7 +711,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             title = "Explicit or Triggering Content Blocked",
             reason = reasonDescription,
             strikeStatus = strikeText,
-            allowFalsePositiveUnblur = true,
+            allowFalsePositiveUnblur = !parentalPinEnabled,
             primaryActionLabel = "Leave Page Safely",
             secondaryActionLabel = "Unblur App for 30s"
         )
@@ -697,6 +739,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
         ) { BlurCensorStyle.FROSTED }
         val showBadge = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BADGE, true)
         val showBorder = prefs.getBoolean(PREFS_KEY_BLUR_SHOW_BORDER, true)
+        val parentalPinEnabled = prefs.getBoolean(PREFS_KEY_PARENTAL_PIN_ENABLED, false)
 
         val totalSeconds = (remainingMs / 1000L).coerceAtLeast(1L)
         val minutes = totalSeconds / 60L
@@ -711,7 +754,7 @@ class AmnGazeAccessibilityService : AccessibilityService() {
             title = "App Locked for 15-Minute Cooldown",
             reason = "3 content violations were recorded in $packageName within 5 minutes.",
             strikeStatus = "COOLDOWN ACTIVE - REMAINING: $formattedRemaining",
-            allowFalsePositiveUnblur = true,
+            allowFalsePositiveUnblur = !parentalPinEnabled,
             primaryActionLabel = "Return to Safe Home",
             secondaryActionLabel = "Unblur App for 30s"
         )

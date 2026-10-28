@@ -12,9 +12,18 @@ class MainActivity : ComponentActivity() {
 
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
+
+    val shortcutPlatformId = intent?.getStringExtra(ShortcutHelper.EXTRA_TARGET_PLATFORM_ID)
+    val shortcutPlatformUrl = intent?.getStringExtra(ShortcutHelper.EXTRA_TARGET_PLATFORM_URL)
+    val deepLinkUrl = shortcutPlatformUrl ?: intent?.dataString
+
     setContent {
-      AmnGazeApp()
+      AmnGazeApp(
+        initialDeepLinkUrl = deepLinkUrl,
+        initialDeepLinkPlatformId = shortcutPlatformId
+      )
     }
   }
 }
+
 
