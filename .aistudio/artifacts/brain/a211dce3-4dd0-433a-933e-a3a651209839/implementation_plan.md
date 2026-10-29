@@ -1,101 +1,99 @@
-# Real-Time LiteRT Inference Optimization, Gender-Isolated Detection, Solid Blur Intensity (`1..10`) & Dynamic Overlay Persistence Plan
+# AmnGaze Content Blocker — Real-Device Accuracy & 100% Opaque Regional Blur Fix Plan
 
-## 1. Root-Cause Findings from Codebase & Model Investigation
+Delivers a targeted 3-stage accuracy and rendering upgrade to eliminate see-through regional blur stripes on physical Android devices, stop `DEFAULT_NSFW` (`amn_gaze.tflite`) Caffe BGR mean-subtraction false positives on text/UI screens, and prevent background grid walls from being blurred while ensuring face-free lingerie/body tiles are reliably detected and tightly bounded.
 
-### A. Why Blur Intensity / Effect Strength (`1..10`) Could Not Reach Solid (Zero See-Through)
-1. **Hard-Capped Alpha Below `255` in `RegionalBlurOverlayView.kt`:**
-   - **Blur Style (`drawBlurStyle`, line 99):** `val alpha = (175 + (effectStrength.coerceIn(1, 10) * 6)).coerceIn(180, 240)` hard-caps alpha at `240` (`~94%`), never reaching `255` (100% solid opaque). Even at `10/10`, underlying high-contrast colors/silhouettes bleed through the translucent region.
-   - **Pixelate Style (`drawPixelateStyle`, lines 123–145):** Base fill alpha is hardcoded to `215` (`~84%`) and grid cells are hardcoded to `160..245` regardless of `effectStrength`. In addition, `computePixelationBlockSizeDp()` scaled blocks from `8dp` (`1/10`) up to `36dp` (`10/10`), making `10/10` *coarser/sparser* with gaps instead of denser and more solid.
-   - **Solid Styles (`drawSolidStyle`, lines 170–174):** `GRAY` and `SKIN` cap alpha at `250` (`coerceIn(205, 250)`), never reaching `255` opaque, while `BLACK` starts at `223` at `1/10` rather than offering a smooth transparency-to-solidness range across `1..10`.
-2. **In-App WebView CSS Blur Bleed-Through (`WebViewModerationBridge.kt`, lines 288–305):**
-   - Applying CSS `filter: blur(Npx)` alone leaves low-frequency skin/color contours visible at high strength unless paired with progressive contrast compression and solid backdrop opacity scaling at higher strength levels (`8..10/10`).
+## User Review & Critical Decisions
 
-### B. Why Selecting `Female` Still Blurred `Male` Faces, Figures & Skin (and Vice-Versa)
-1. **Binary Face Classifier (`model_lite_gender_q.tflite`) Fed Non-Face / Full-Body Crops:**
-   - Inspection of `app/src/main/assets/model_lite_gender_q.tflite` confirms input `input_4` is `[1, 128, 128, 3]` and output `Identity` is `[1, 2]` (`[0] = Male`, `[1] = Female`). Because its 2-class softmax always sums to `1.0` (`maleProb + femaleProb == 1.0`) with **no background or non-face class**, passing full-screen bands (`0.12..0.88`) or torso/background crops into `GENDER_FILTER` produces arbitrary `Male`/`Female` probabilities on non-face regions.
-2. **Gender-Agnostic `sexy` Skin Score Overriding Target Gender:**
-   - In `ContentModerationEngine.classifyCropForHaramBlur()` (line 884), `nsfwConfidence` was set to `femaleScore`, and in `WebViewModerationBridge.kt` (line 454), `val shouldBlur = nsfwVerdict.isViolation || shouldBlurGender`.
-   - Because the 5-class `QUANTIZED_NSFW` model (`[0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy`) triggers `sexy` on **any** exposed skin (such as a shirtless man, male athlete, or male arms/chest), male exposed skin triggered `nsfwVerdict.isViolation` even when `Who to Blur = Female` and the detected face was `MALE`.
+> [!IMPORTANT]
+> All requirements, thresholds, and rendering behaviors are specified in detail and ready for execution upon approval:
 
-### C. LiteRT Inference & Frame-Processing Bottlenecks (Careful, Non-Destructive Optimization)
-1. **Per-Crop Direct ByteBuffer & Bitmap Allocations (`ContentModerationEngine.kt`):**
-   - `preprocessBitmap()` allocates a new `ByteBuffer.allocateDirect(...)`, `IntArray`, and scaled `Bitmap` on every crop (`9` to `16+` allocations per frame), causing GC pauses during continuous real-time scanning.
-2. **Redundant Double Inference on Safe Crops (`ContentModerationEngine.kt`, lines 501–526):**
-   - `classifySingleCropInternal()` runs a second full LiteRT `interpreter.run(...)` with `ALT_FLOAT` normalization whenever a crop is safe (`< threshold`), doubling inference time on every safe crop.
-3. **Synchronous Full-WebView UI-Thread Rasterization (`WebViewModerationBridge.kt`, lines 387–393):**
-   - Calling `webView.draw(canvas)` on a full-resolution `ARGB_8888` bitmap every `220ms` on `Dispatchers.Main` blocks scrolling in the In-App Protected Browser.
-
-### D. Real-Time Regional Overlay Persistence Issues
-1. **Overlay Self-Occlusion in `MediaProjection` (`HaramBlurProjectionService.kt`):**
-   - Once `RegionalBlurOverlayView` draws over a detected face/body region, the next `MediaProjection` frame captures the *blur box itself* instead of the underlying face/skin.
-2. **Scroll Events Wiping All Regions (`AmnGazeAccessibilityService.kt` & `HaramBlurEngineLogic.kt`):**
-   - `TYPE_VIEW_SCROLLED` often reports `scrollDeltaY = 0f`, and `onScrollDetected(0f)` immediately executed `activeRegions.clear()`, causing overlays to blink off while scrolling.
+- **100% Opaque Regional Rendering (`alpha = 255`) with Real Sampled Patches**: Every regional blur overlay (`BLUR`, `PIXELATE`, `BLACK`, `GRAY`, `SKIN`) renders at `alpha = 255` (`100%` solid opaque) with zero vertical stripes or tile gaps (`gap = 0f`), using a real sampled color grid / downscaled `8x8` patch from the unoccluded frame so `Effect Strength (1..10)` controls pixelation block coarseness (`12dp..38dp`) and blur diffusion while never allowing raw underlying pixels to bleed through.
+- **Exclusive `QUANTIZED_NSFW` 5-Class Scoring + Skin/UI Presence Gate**: Eliminates `DEFAULT_NSFW` (`amn_gaze.tflite`) fallback poisoning on `[0..1]` RGB crops, enforces a `skinRatio < 0.045f` short-circuit (`< 0.05f` inside `computeFiveClassNsfwScore` when `pornProb < 0.82f`), lowers the `neutral + drawings` safe UI guard to `0.50f`, suppresses false `hentaiProb` spikes on 2D UI, and raises strict sensitivity thresholds (`20% -> 0.78f`, `25% -> 0.74f`, `50% -> 0.60f`, `75% -> 0.48f`, `95% -> 0.38f`).
+- **Face-Anchored Gender Classification + Unanchored Grid Body/Lingerie Detection**: `GENDER_FILTER` (`model_lite_gender_q.tflite`) is restricted strictly to localized face anchors (`isFaceAnchor == true`) and never runs on face-free grid cells (`isGridCell == true`). Unanchored grid cells and body crops evaluate full-crop `QUANTIZED_NSFW` + skin ratio (`gender = UNKNOWN`), blurring whenever `explicitPornNudityConfidence + revealingSkinConfidence >= max(0.42f, sensitivity.threshold)` and `revealingSkinConfidence >= 0.25f` (or `explicitPornNudityConfidence >= 0.35f`), with tight `16x16` skin-contour bounding box refinement (`+8%` padding) and adjacent box merging.
 
 ---
 
-## 2. Planned Architecture & Surgical Changes
+## 1. Overview & Core Concept
 
-### Step 1: Effect Strength (`1..10`) Solidness vs. Transparency & Density Curve
-- **Files:** `HaramBlurEngineLogic.kt`, `RegionalBlurOverlayView.kt`, `WebViewModerationBridge.kt`, `HaramBlurDashboardSection.kt`, `InAppProtectionScreens.kt`, `AmnGazeViewModel.kt`
-- **Unified Solidness & Density Curve (`HaramBlurFilterLogic`):**
-  - Add `computeOverlayAlpha(effectStrength: Int): Int`:
-    - `1/10` → `alpha = 115` (`~45%` solidness — light translucent veil)
-    - `3/10` → `alpha = 158` (`~62%` solidness)
-    - `5/10` → `alpha = 198` (`~78%` solidness — medium dense blur)
-    - `7/10` → `alpha = 232` (`~91%` solidness — heavy dense blur)
-    - `8/10` → `alpha = 246` (`~96%` solidness)
-    - `9/10` → `alpha = 255` (`100%` solid opaque — zero see-through)
-    - `10/10` → `alpha = 255` (`100%` solid opaque + maximum layer/tile density — zero see-through)
-  - Add `computeDensityFactor(effectStrength: Int): Float` (`0.1f..1.0f`) to control internal layer count, frosted grid density, and pixelation tile packing density:
-    - **Blur (`BLUR`):** Base fill uses `computeOverlayAlpha(effectStrength)` (reaching `alpha = 255` solid opaque at `9..10/10`), plus dense multi-band frosted diffusion layers that scale with `effectStrength` so `9..10/10` is completely solid with zero see-through.
-    - **Pixelate (`PIXELATE`):** Base backing fill uses `computeOverlayAlpha(effectStrength)` (reaching `alpha = 255` at `9..10/10`), tile gaps shrink to `0f` at high intensity (`>= 8/10`), and tile alpha scales up to `255` so high strength produces a completely solid, dense mosaic with zero see-through.
-    - **Solid (`BLACK`, `GRAY`, `SKIN`):** Alpha scales smoothly via `computeOverlayAlpha(effectStrength)` from `115` (`1/10`) all the way to `255` (`9..10/10` 100% opaque solid cover).
-  - **In-App Browser Overlay Strength Sync (`WebViewModerationBridge.kt` & `AmnGazeViewModel.kt`):**
-    - Sync `updateHaramBlurEffectStrength(1..10)` and `updateInAppBlurStrengthPx(1..20)` so adjusting Effect Strength in either Dashboard or Settings updates both consistently.
-    - In `WebViewModerationBridge.applyOverlayStyle()`, scale both blur radius and solidness (contrasting/dimming backdrop opacity up to 100% opaque solid cover at `9..10/10` / `18..20px`) so high intensity leaves zero see-through silhouette.
-  - **UI Clarity (`HaramBlurDashboardSection.kt` & `InAppProtectionScreens.kt`):**
-    - Display the live solidness/density percentage alongside the `Effect Strength: X / 10` slider label (e.g., `Solidness: 100% (Solid)` at `9–10/10`).
-
-### Step 2: Strict Gender-Isolated Detection + Mandatory Pornography/Nudity Blurring
-- **Files:** `HaramBlurEngineLogic.kt`, `ContentModerationEngine.kt`, `WebViewModerationBridge.kt`
-- **Two-Tier Detection Policy (`HaramBlurFilterLogic` & `CandidateBlurBox`):**
-  1. **Mandatory Explicit Nudity / Pornography Rule (Always Active for Any Gender):**
-     - Hardcore pornography/hentai (`pornScore + hentaiScore` from 5-class `QUANTIZED_NSFW`, or high-confidence explicit nudity `>= 0.72f` from `DEFAULT_NSFW`) is **always** blurred regardless of whether `Who to Blur` is `Female`, `Male`, or `Both`.
-  2. **Gender-Specific Face, Figure & Exposed Skin Rule (`Female`, `Male`, `Both`):**
-     - Face crops (`128x128` aspect-preserved head regions) are evaluated by `GENDER_FILTER` (`model_lite_gender_q.tflite`) only when skin/face presence is verified, with a clear confidence margin (`>= 0.58f`) so background tiles are never misclassified as a face.
-     - Upper-body / torso / skin regions below or adjacent to a detected face inherit that person's verified gender (`FEMALE` or `MALE`).
-     - When `Who to Blur = Female`:
-       - Blurs detected **Female** faces, **Female** figures/bodies, and **Female** exposed skin (`sexy` / skin exposure score).
-       - If a subject's face is classified as `MALE` (and confidence is below the mandatory hardcore porn/explicit nudity ceiling), **neither** his face **nor** his body/exposed skin is blurred.
-     - When `Who to Blur = Male`:
-       - Blurs detected **Male** faces, **Male** figures/bodies, and **Male** exposed skin, while never blurring non-explicit `FEMALE` faces or skin.
-     - When `Who to Blur = Both`:
-       - Blurs both `FEMALE` and `MALE` faces, figures, and exposed skin regions.
-
-### Step 3: Careful, Non-Destructive LiteRT Pre-Processing & Tensor Reuse
-- **File:** `ContentModerationEngine.kt`
-- **Surgical Optimizations (Preserving All Public Signatures & Fallbacks):**
-  - Keep all existing public methods, model loading fallbacks, and tensor shape inspections intact.
-  - Replace per-crop allocations inside `preprocessBitmap()` with pre-allocated reusable buffers (`Canvas` + `Matrix` into a reusable target `Bitmap`, reusable `IntArray`, reusable direct `ByteBuffer` per model input size `128x128` and `224x224`, and a 256-entry `FLOAT_MINUS1_TO_1_LUT` lookup table) guarded by `inferenceLock`.
-  - Remove the redundant second `ALT_FLOAT` inference pass on crops that already scored clearly safe on the primary normalized pass.
-
-### Step 4: Real-Time Regional Tracking Without Self-Occlusion or Scroll Wipeouts
-- **Files:** `HaramBlurProjectionService.kt`, `HaramBlurEngineLogic.kt`, `AmnGazeAccessibilityService.kt`
-- **Unoccluded Reference Patch Restoration:**
-  - Before applying overlays on a newly captured frame, `HaramBlurProjectionService` caches the unblurred pixels under each active bounding box (`lastCleanFrameBitmap`). On the next capture cycle, if an active overlay covers a region, the clean underlying patch is composite-restored into the analysis copy if the surrounding border pixels haven't changed, preventing the overlay from blinding the detector while immediately detecting when the subject moves or leaves.
-- **Smooth Coordinate Tracking:**
-  - Replace `activeRegions.clear()` on `scrollDeltaY == 0f` with fast scan scheduling (`45ms` cadence during scroll) and smooth bounding-box interpolation (`lerp` `0.65f` new / `0.35f` previous when IoU `>= 0.25f`).
-
-### Step 5: Opt-In Setting to Pre-Blur / Hide Newly Appearing Media Until Scanned
-- **Files:** `AmnGazeState.kt`, `AmnGazeViewModel.kt`, `HaramBlurDashboardSection.kt`, `InAppProtectionScreens.kt`, `WebViewModerationBridge.kt`, `MainActivity.kt`
-- Add `preBlurNewMediaUntilScanned: Boolean = false` (persisted via `PREFS_KEY_PRE_BLUR_NEW_MEDIA`) to both System-Wide and In-App Settings so users can optionally pre-blur newly appearing `<img>`/`<video>` elements and incoming transitions until the AI scan confirms they are safe.
+- **What It Does**:
+  1. Replaces semi-transparent (`alpha < 255`) and striped regional overlays with **100% opaque (`alpha = 255`)** real pixel-sampled mosaic/frosted patches and high-attenuation WebView CSS filters (`filter: blur(28px) brightness(0.22) contrast(0.4)`).
+  2. Eliminates false-positive full-screen blocks on text-only pages, settings screens, and vector UI chrome in Module 1 (Explicit Content Blocker).
+  3. Fixes Module 2 (HaramBlur) 3x3 profile grids and Reels feeds so walls/curtains are never falsely labeled `FEMALE`, while headless lingerie/body photos are never falsely vetoed as `MALE`.
+- **Target Audience / Persona**: Users running AmnGaze on physical Android devices across social feeds, profile grids, video streams, and web browsers who require zero see-through censorship and zero false triggers on text/UI screens.
+- **Key Value**: True 100% opaque regional occlusion on hardware displays, immunity to text/UI false positives, and high-precision body/face regional bounding boxes.
 
 ---
 
-## 3. Verification Plan
-1. **Unit & Logic Tests (`AmnGazeLogicTest.kt`):**
-   - Verify `HaramBlurFilterLogic.computeOverlayAlpha(1..10)` scales from translucent (`115` at `1/10`) to **100% solid opaque (`255` at `9/10` and `10/10`)**.
-   - Verify gender isolation: when `targetGender = FEMALE`, a `MALE` subject with exposed skin (`revealingSkinConfidence = 0.70f`, `explicitPornNudityConfidence = 0.10f`) returns `shouldBlur = false`, while a `FEMALE` subject returns `shouldBlur = true`, and hardcore explicit nudity (`explicitPornNudityConfidence = 0.85f`) returns `shouldBlur = true` for any gender.
-   - Verify `AntiFlickerRegionTracker` does not wipe regions on `scrollDeltaY = 0f` and smoothly tracks moving boxes.
-2. **Build & Test Execution:**
-   - Run `gradle :app:testDebugUnitTest` and `compile_applet` to ensure zero build or runtime regressions.
+## 2. User Experience & Visual Design
+
+- **Key User Flows**:
+  - **Real-Time Regional Blur (`BLUR` / `PIXELATE` / `BLACK` / `GRAY` / `SKIN`)**:
+    - `PIXELATE`: Renders a 100% opaque (`#FF0F172A`) base rounded rect covered by an `8x8` sampled color mosaic from the unoccluded frame (desaturated and darkened into a safe slate palette) with `alpha = 255`, `gap = 0f`, and tile sizes scaling from `12dp` (`1/10`) to `38dp` (`10/10`).
+    - `BLUR`: Renders a 100% opaque (`#FF1E293B`) base rounded rect with an `8x8` bilinearly upscaled (`FILTER_BITMAP_FLAG`) and darkened frosted patch at `alpha = 255` with zero vertical/horizontal stripes.
+    - `BLACK` / `GRAY` / `SKIN`: Renders a 100% solid opaque (`alpha = 255`) rounded rect (`#FF000000`, `#FF64748B`, `#FFD4A373`) across all strength levels `1..10`.
+  - **In-App Protected Browser**:
+    - Blurred DOM images and videos apply `filter: blur(28px) brightness(0.22) contrast(0.4)` paired with an opaque backdrop color so underlying contours never bleed through.
+- **Visual Identity & Theme**:
+  - High-contrast dark slate privacy surfaces (`#FF0F172A`, `#FF1E293B`, `#FF64748B`) with smooth `14dp` rounded corners and zero jail-bar stripe artifacts.
+
+---
+
+## 3. Key Product Decisions & Trade-Offs
+
+- **Decision 1: 100% Opaque (`alpha = 255`) Regional Rendering with Sampled Unoccluded Patches**
+  - *Chosen Approach*: Always return `255` from `computeOverlayAlpha(1..10)` and attach an `8x8` sampled color grid (`sampledColors: IntArray`) / downscaled patch extracted from the unoccluded `frameBitmap` to each `TrackedBlurRegion`. Use `Effect Strength (1..10)` to control mosaic tile coarseness (`12dp..38dp`) and frosted diffusion intensity while maintaining `alpha = 255` and `gap = 0f`.
+  - *Why*: An Android `TYPE_APPLICATION_OVERLAY` Canvas draws *on top* of the compositor surface rather than blurring the underlying window buffer; any `alpha < 255` or inter-tile gap acts like a tinted window and reveals the face/body underneath.
+- **Decision 2: Exclusive `QUANTIZED_NSFW` + Skin/UI Presence Gate for Module 1**
+  - *Chosen Approach*: Use `QUANTIZED_NSFW` (`nsfw_mobilenet_v2_140_224_quantized.tflite`) exclusively for 5-class NSFW scoring, short-circuiting crops with `skinRatio < 0.045f` before inference, returning `0.0f` when `skinRatio < 0.05f && pornProb < 0.82f` or `(neutralProb + drawingsProb) >= 0.50f`, and gating `hentaiProb` behind `hentaiProb >= 0.65f && neutralProb < 0.20f && skinRatio >= 0.08f`.If `DEFAULT_NSFW` (`amn_gaze.tflite`) is ever called directly, preprocess with Caffe BGR mean subtraction (`B - 104f, G - 117f, R - 123f`).
+  - *Why*: Prevents `amn_gaze.tflite` from misinterpreting `[0..1]` RGB inputs as solid flesh tone and stops MobileNetV2 `drawings`/`hentai` activations on 2D app UI and text pages.
+- **Decision 3: Face-Only `GENDER_FILTER` & Tight Skin-Contour Grid Bounding Boxes**
+  - *Chosen Approach*: Never invoke `GENDER_FILTER` (`model_lite_gender_q.tflite`) on face-free grid cells (`isGridCell == true`). Evaluate unanchored grid cells with full-crop `QUANTIZED_NSFW` + skin ratio (`gender = UNKNOWN`), tighten triggered grid rectangles to the `16x16` skin/foreground contour (`+8%` padding), merge adjacent boxes (`IoU >= 0.15f` or shared edge overlap `>= 0.50f` when `<= 3` cells trigger), and update `lastUnoccludedFrame` only outside `currentLockedRects`.
+  - *Why*: Eliminates false `FEMALE` labels on background walls/curtains, eliminates false `MALE` vetoes on headless lingerie/body tiles, and prevents drawn overlay boxes from being copied into the clean reference frame.
+
+---
+
+## 4. Technical Architecture & Data Strategy *(Technical Reference)*
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                   MediaProjection / Accessibility Frame                      │
+└──────────────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│            Unoccluded Reference Frame Manager (Outside Active Rects)         │
+│  • Restores clean pixels inside currentLockedRects when scene is stationary  │
+│  • Updates lastUnoccludedFrame ONLY outside currentLockedRects               │
+│  • Extracts 8x8 desaturated/darkened color grid per TrackedBlurRegion        │
+└───────────────────┬──────────────────────────────────────┬───────────────────┘
+                    │                                      │
+                    ▼                                      ▼
+┌──────────────────────────────────────┐  ┌────────────────────────────────────┐
+│   Module 1: Explicit Content Blocker │  │  Module 2: HaramBlur Regional Scan │
+│  • Skin Presence Gate (<4.5% -> SAFE)│  │  • Face Anchors -> GENDER_FILTER   │
+│  • QUANTIZED_NSFW 5-Class Exclusive  │  │  • Unanchored Grid -> UNKNOWN +    │
+│  • Safe UI Guard (neutral+draw>=0.50)│  │    QUANTIZED_NSFW Body/Skin Score  │
+│  • Strict Thresholds (0.78f..0.38f)  │  │  • Tight 16x16 Skin-Contour + Merge│
+└──────────────────────────────────────┘  └────────────────┬───────────────────┘
+                                                           │
+                                                           ▼
+                                          ┌────────────────────────────────────┐
+                                          │ 100% Opaque Regional Render Engine │
+                                          │  • alpha = 255 across 1..10        │
+                                          │  • PIXELATE: 12dp..38dp, gap = 0f  │
+                                          │  • BLUR: 8x8 upscaled + dark frost │
+                                          │  • BLACK / GRAY / SKIN: solid 255  │
+                                          └────────────────────────────────────┘
+```
+
+### Data Model & State Updates
+- **`CandidateBlurBox`**:
+  - Adds `isGridCell: Boolean = false` and `skinRatio: Float = 0f` so `HaramBlurFilterLogic.shouldBlurCandidate` distinguishes localized face anchors (`!isGridCell && gender != UNKNOWN`) from unanchored grid/body cells (`isGridCell || gender == UNKNOWN`).
+- **`TrackedBlurRegion`**:
+  - Adds `sampledColors: IntArray? = null` (`8x8` = 64 opaque ARGB colors sampled and desaturated/darkened from the unoccluded `frameBitmap` region) so `RegionalBlurOverlayView` renders real pixelated/blurred patches at `alpha = 255` with zero vertical stripes and zero gaps.
+- **Verification Gate**:
+  - Unit tests in `AmnGazeLogicTest` covering:
+    1. Zero false positives on text/UI crops (`skinRatio < 0.05f` or `neutral + drawings >= 0.50f`, even when `hentaiProb = 0.60f`).
+    2. No `GENDER_FILTER` on face-free grid cells (`classifyCropForHaramBlur(cropBitmap, isGridCell = true)` returns `gender == DetectedGender.UNKNOWN` and `shouldBlurCandidate == false` on background tiles).
+    3. Lingerie/body grid tile blurring (`isGridCell = true`, `gender = UNKNOWN`, `revealingSkinConfidence = 0.55f` returns `true` in `FEMALE` mode).
+    4. 100% opaque overlay alpha (`computeOverlayAlpha(1..10) == 255`) and `computePixelationBlockSizeDp(1..10)` scaling (`12f..38f`).

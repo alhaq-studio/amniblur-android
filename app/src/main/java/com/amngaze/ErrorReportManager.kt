@@ -3,6 +3,7 @@ package com.amngaze
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import androidx.core.content.pm.PackageInfoCompat
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -20,6 +21,9 @@ class ErrorReportManager private constructor(private val context: Context) {
     init {
         errorDir.mkdirs()
     }
+
+    @Suppress("DEPRECATION")
+    private fun resolveThreadId(thread: Thread): Long = thread.id
 
     /**
      * Log a fatal crash with system and memory details
@@ -46,7 +50,8 @@ class ErrorReportManager private constructor(private val context: Context) {
             // App Information
             entry.append("\n--- APP INFORMATION ---\n")
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            entry.append("App Version: ${pInfo.versionName} (${pInfo.versionCode})\n")
+            val versionCode = PackageInfoCompat.getLongVersionCode(pInfo)
+            entry.append("App Version: ${pInfo.versionName} ($versionCode)\n")
             entry.append("Package: ${context.packageName}\n")
 
             // Memory Status
@@ -62,7 +67,7 @@ class ErrorReportManager private constructor(private val context: Context) {
 
             // Exception Details
             entry.append("\n--- EXCEPTION DETAILS ---\n")
-            entry.append("Thread: ${thread.name} (ID: ${thread.id})\n")
+            entry.append("Thread: ${thread.name} (ID: ${resolveThreadId(thread)})\n")
             entry.append("Exception Type: ${throwable.javaClass.name}\n")
             entry.append("Message: ${throwable.message ?: "No error message description available."}\n")
             

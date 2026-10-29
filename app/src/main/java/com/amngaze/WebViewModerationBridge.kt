@@ -253,7 +253,8 @@ class WebViewModerationBridge(
             whatToProtect: Set<WhatToProtectItem>,
             blurStyle: HaramBlurOverlayStyle,
             strengthPx: Int,
-            feedControlConfig: FeedControlConfig
+            feedControlConfig: FeedControlConfig,
+            preBlurNewMediaUntilScanned: Boolean = false
         ): String {
             val protectImages = WhatToProtectItem.IMAGES in whatToProtect
             val protectVideos = WhatToProtectItem.VIDEOS in whatToProtect
@@ -264,9 +265,15 @@ class WebViewModerationBridge(
 
             return """
                 (function() {
+                    window.__amngazePreBlurEnabled = $preBlurNewMediaUntilScanned;
+                    window.__amngazeDefaultStyle = '${blurStyle.name}';
+                    window.__amngazeDefaultStrengthPx = $strengthPx;
                     if (window.__amngazeInitialized) {
                         if (window.__amngazeUpdateFeedCss) {
                             window.__amngazeUpdateFeedCss('$feedCss');
+                        }
+                        if (window.__amngazeRefreshActiveOverlays) {
+                            window.__amngazeRefreshActiveOverlays('${blurStyle.name}', $strengthPx);
                         }
                         return;
                     }
@@ -286,29 +293,38 @@ class WebViewModerationBridge(
                     };
 
                     function applyOverlayStyle(el, styleName, px) {
-                        var blurPx = Math.max(8, px * 2);
                         if (styleName === 'BLACK') {
-                            el.style.filter = 'brightness(0)';
+                            el.style.filter = 'brightness(0) contrast(0)';
                             el.style.backgroundColor = '#000000';
                         } else if (styleName === 'GRAY') {
-                            el.style.filter = 'brightness(0) invert(0.56)';
-                            el.style.backgroundColor = '#8E8E93';
+                            el.style.filter = 'brightness(0) invert(0.4)';
+                            el.style.backgroundColor = '#64748B';
                         } else if (styleName === 'SKIN') {
-                            el.style.filter = 'blur(' + blurPx + 'px) sepia(0.45)';
-                            el.style.backgroundColor = '#E8BEAC';
+                            el.style.filter = 'brightness(0) invert(0.7) sepia(0.3)';
+                            el.style.backgroundColor = '#D4A373';
                         } else if (styleName === 'PIXELATE') {
-                            el.style.filter = 'blur(' + blurPx + 'px) contrast(1.35)';
+                            el.style.filter = 'blur(28px) brightness(0.22) contrast(0.4)';
+                            el.style.backgroundColor = '#0F172A';
                         } else {
-                            el.style.filter = 'blur(' + blurPx + 'px)';
+                            // BLUR style: heavy opaque blur overlay with dark slate backdrop
+                            el.style.filter = 'blur(28px) brightness(0.22) contrast(0.4)';
+                            el.style.backgroundColor = '#1E293B';
                         }
-                        el.style.transition = 'filter 0.12s ease-out';
+                        el.style.transition = 'filter 0.10s ease-out';
                     }
+
+                    window.__amngazeRefreshActiveOverlays = function(styleName, px) {
+                        var blurredNodes = document.querySelectorAll('[data-amngaze-verdict="BLURRED"]');
+                        for (var i = 0; i < blurredNodes.length; i++) {
+                            applyOverlayStyle(blurredNodes[i], styleName, px);
+                        }
+                    };
 
                     window.__amngazeApplyVerdicts = function(payload) {
                         try {
                             var data = (typeof payload === 'string') ? JSON.parse(payload) : payload;
-                            var styleName = data.style || '${blurStyle.name}';
-                            var px = data.strengthPx || $strengthPx;
+                            var styleName = data.style || window.__amngazeDefaultStyle || '${blurStyle.name}';
+                            var px = data.strengthPx || window.__amngazeDefaultStrengthPx || $strengthPx;
                             var list = data.verdicts || [];
                             for (var i = 0; i < list.length; i++) {
                                 var v = list[i];
@@ -320,6 +336,7 @@ class WebViewModerationBridge(
                                 } else {
                                     el.dataset.amngazeVerdict = 'SAFE';
                                     el.style.filter = '';
+                                    el.style.backgroundColor = '';
                                 }
                             }
                         } catch (e) {}
@@ -337,7 +354,7 @@ class WebViewModerationBridge(
                         var nodes = document.querySelectorAll(selectors.join(','));
                         var batch = [];
                         var now = Date.now();
-                        for (var i = 0; i < nodes.length && batch.length < 8; i++) {
+                        for (var i = 0; i < nodes.length && batch.length < 6; i++) {
                             var el = nodes[i];
                             var tag = (el.tagName || 'IMG').toUpperCase();
                             var verdict = el.dataset.amngazeVerdict || '';
@@ -346,7 +363,7 @@ class WebViewModerationBridge(
                             if (tag === 'IMG' && (verdict === 'SAFE' || verdict === 'BLURRED')) {
                                 continue;
                             }
-                            if (tag === 'VIDEO' && (now - lastScan) < 900) {
+                            if (tag === 'VIDEO' && (now - lastScan) < 750) {
                                 continue;
                             }
 
@@ -356,6 +373,10 @@ class WebViewModerationBridge(
 
                             if (!el.dataset.amngazeId) {
                                 el.dataset.amngazeId = 'ag_' + (nextId++);
+                            }
+                            if (window.__amngazePreBlurEnabled && !verdict) {
+                                el.dataset.amngazeVerdict = 'PREBLUR';
+                                applyOverlayStyle(el, window.__amngazeDefaultStyle, window.__amngazeDefaultStrengthPx);
                             }
                             el.dataset.amngazeLastScan = String(now);
                             batch.push({
@@ -374,9 +395,9 @@ class WebViewModerationBridge(
                         }
                     }
 
-                    setInterval(collectVisibleMedia, 220);
+                    setInterval(collectVisibleMedia, 240);
                     window.addEventListener('scroll', function() {
-                        setTimeout(collectVisibleMedia, 140);
+                        setTimeout(collectVisibleMedia, 120);
                     }, { passive: true });
                 })();
             """.trimIndent()
@@ -384,6 +405,7 @@ class WebViewModerationBridge(
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val isBatchProcessing = java.util.concurrent.atomic.AtomicBoolean(false)
 
     @Volatile
     private var attachedWebView: WebView? = null
@@ -400,12 +422,20 @@ class WebViewModerationBridge(
     fun onVisibleMediaBatch(jsonBatch: String) {
         val items = parseVisibleMediaBatchJson(jsonBatch)
         if (items.isEmpty()) return
+        if (!isBatchProcessing.compareAndSet(false, true)) return
 
         mainHandler.post {
-            val webView = attachedWebView ?: return@post
+            val webView = attachedWebView
+            if (webView == null) {
+                isBatchProcessing.set(false)
+                return@post
+            }
             val viewW = webView.width
             val viewH = webView.height
-            if (viewW <= 0 || viewH <= 0) return@post
+            if (viewW <= 0 || viewH <= 0) {
+                isBatchProcessing.set(false)
+                return@post
+            }
 
             val targetW = VIEWPORT_CAPTURE_WIDTH
             val targetH = ((viewH.toFloat() / viewW.toFloat()) * targetW).roundToInt().coerceAtLeast(224)
@@ -418,7 +448,11 @@ class WebViewModerationBridge(
             } catch (t: Throwable) {
                 Log.w(TAG, "Could not capture WebView viewport bitmap", t)
                 null
-            } ?: return@post
+            }
+            if (snapshot == null) {
+                isBatchProcessing.set(false)
+                return@post
+            }
 
             val currentState = stateProvider()
             scope.launch(Dispatchers.Default) {
@@ -435,32 +469,29 @@ class WebViewModerationBridge(
                                 cropRect.width(),
                                 cropRect.height()
                             )
-                            val nsfwVerdict = moderationEngine.classifyBitmap(
-                                bitmap = cropBmp,
-                                sensitivity = when (currentState.haramBlurSensitivity) {
-                                    HaramBlurSensitivity.LOW -> 0.30f
-                                    HaramBlurSensitivity.MEDIUM -> 0.50f
-                                    HaramBlurSensitivity.HIGH -> 0.78f
-                                },
-                                modelType = currentState.amnGazeModelType,
-                                includeSexyScore = currentState.includeSexyInNsfwScore
-                            )
-                            val genderCandidate = moderationEngine.classifyCropForHaramBlur(cropBmp)
-                            val shouldBlurGender = HaramBlurFilterLogic.shouldBlurCandidate(
-                                candidate = genderCandidate,
+                            val (shouldBlur, candidate) = moderationEngine.evaluateMediaCropForProtection(
+                                cropBitmap = cropBmp,
                                 targetGender = currentState.haramBlurTargetGender,
                                 sensitivity = currentState.haramBlurSensitivity
                             )
-                            val shouldBlur = nsfwVerdict.isViolation || shouldBlurGender
                             if (shouldBlur) {
                                 onDetectionRecorded()
                             }
+                            val bestConfidence = maxOf(
+                                candidate.explicitPornNudityConfidence,
+                                candidate.genderConfidence,
+                                candidate.revealingSkinConfidence
+                            )
                             verdicts.add(
                                 MediaVerdict(
                                     id = item.id,
                                     shouldBlur = shouldBlur,
-                                    reason = if (nsfwVerdict.isViolation) nsfwVerdict.categoryName else genderCandidate.gender.name,
-                                    confidence = maxOf(nsfwVerdict.confidence, genderCandidate.genderConfidence)
+                                    reason = if (candidate.explicitPornNudityConfidence >= 0.55f) {
+                                        "EXPLICIT_NSFW"
+                                    } else {
+                                        candidate.gender.name
+                                    },
+                                    confidence = bestConfidence
                                 )
                             )
                         } catch (_: Throwable) {
@@ -478,6 +509,7 @@ class WebViewModerationBridge(
                         if (!snapshot.isRecycled) snapshot.recycle()
                     } catch (_: Throwable) {
                     }
+                    isBatchProcessing.set(false)
                 }
 
                 if (verdicts.isNotEmpty()) {

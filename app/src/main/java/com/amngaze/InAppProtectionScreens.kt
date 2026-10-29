@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.AddToHomeScreen
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
@@ -339,6 +340,16 @@ fun SettingsScreen(
                 // System-Wide Mode Rows
                 item {
                     SettingsRowCard(
+                        icon = Icons.Default.BlurOn,
+                        title = "Blur Style & Pre-Blur Media",
+                        value = "${state.blurStyleSummary} | Pre-Blur: ${if (state.preBlurNewMediaUntilScanned) "On" else "Off"}",
+                        onClick = { runWithPinGate { showBlurStyleDialog = true } },
+                        testTag = "settings_row_blur_style"
+                    )
+                }
+
+                item {
+                    SettingsRowCard(
                         icon = Icons.Default.Tune,
                         title = "Detection Sensitivity",
                         value = state.haramBlurSensitivity.shortLabel,
@@ -517,8 +528,10 @@ fun SettingsScreen(
         BlurStyleSheetDialog(
             currentStyle = state.haramBlurOverlayStyle,
             currentStrengthPx = state.inAppBlurStrengthPx,
+            preBlurNewMedia = state.preBlurNewMediaUntilScanned,
             onUpdateStyle = { viewModel.updateHaramBlurOverlayStyle(it) },
             onUpdateStrengthPx = { viewModel.updateInAppBlurStrengthPx(it) },
+            onTogglePreBlurNewMedia = { viewModel.setPreBlurNewMediaUntilScanned(it) },
             onDismiss = { showBlurStyleDialog = false }
         )
     }
@@ -820,7 +833,7 @@ private fun ConnectedPlatformGridCard(
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.AddToHomeScreen,
+                    imageVector = Icons.AutoMirrored.Filled.AddToHomeScreen,
                     contentDescription = "Add Shortcut",
                     modifier = Modifier.size(16.dp)
                 )
@@ -955,6 +968,7 @@ fun InAppBrowserScreen(
     val coroutineScope = rememberCoroutineScope()
     val moderationEngine = remember { ContentModerationEngine(context.applicationContext) }
     val urlScanner = remember { FastPathUrlAndKeywordScanner() }
+    val strikeLockoutManager = remember { StrikeLockoutManager() }
 
     val enabledPlatforms = remember(state.connectedPlatforms) {
         state.connectedPlatforms.filter { it.enabled }.ifEmpty { ConnectedPlatform.defaultPlatforms() }
@@ -966,7 +980,7 @@ fun InAppBrowserScreen(
     var currentUrl by remember(activePlatform.id, initialUrlOverride) {
         mutableStateOf(initialUrlOverride ?: activePlatform.url)
     }
-    var blockedNavigationReason by remember { mutableStateOf<String?>(null) }
+    var blockedNavigationViolation by remember { mutableStateOf<FastPathViolation?>(null) }
     var showPlatformsSheet by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
@@ -1003,8 +1017,8 @@ fun InAppBrowserScreen(
 
     BackHandler {
         val wv = webViewRef
-        if (blockedNavigationReason != null) {
-            blockedNavigationReason = null
+        if (blockedNavigationViolation != null) {
+            blockedNavigationViolation = null
         } else if (wv != null && wv.canGoBack()) {
             wv.goBack()
         } else if (onReturnToSystemDashboard != null) {
@@ -1054,7 +1068,10 @@ fun InAppBrowserScreen(
                     Text("Switch Platform or Open Settings")
                 }
             }
-        } else if (blockedNavigationReason != null) {
+        } else if (blockedNavigationViolation != null) {
+            val activeViolation = blockedNavigationViolation!!
+            val canSnoozeKeyword = !state.parentalPinEnabled &&
+                StrikeLockoutManager.canSnoozeViolationFor30Seconds(activeViolation.triggerSource)
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1065,20 +1082,24 @@ fun InAppBrowserScreen(
             ) {
                 Icon(
                     imageVector = Icons.Default.Shield,
-                    contentDescription = "Blocked Adult URL",
+                    contentDescription = "Blocked Content",
                     tint = MaterialTheme.colorScheme.error,
                     modifier = Modifier.size(64.dp)
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Explicit Domain Blocked by AmnGaze",
+                    text = if (activeViolation.triggerSource == ViolationTriggerSource.ADULT_DOMAIN_URL) {
+                        "Explicit Domain Blocked by AmnGaze"
+                    } else {
+                        "Explicit Content Blocked by AmnGaze"
+                    },
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = blockedNavigationReason ?: "Explicit URL blocked.",
+                    text = activeViolation.reason,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
@@ -1086,11 +1107,27 @@ fun InAppBrowserScreen(
                 Spacer(modifier = Modifier.height(20.dp))
                 Button(
                     onClick = {
-                        blockedNavigationReason = null
+                        blockedNavigationViolation = null
                         webViewRef?.loadUrl(activePlatform.url)
-                    }
+                    },
+                    modifier = Modifier.testTag("in_app_leave_page_safely_button")
                 ) {
-                    Text("Return to ${activePlatform.name}")
+                    Text("Leave Page Safely (Return to ${activePlatform.name})")
+                }
+                if (canSnoozeKeyword) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            strikeLockoutManager.snoozeKeywordTextOnly(
+                                activePlatform.id,
+                                android.os.SystemClock.elapsedRealtime()
+                            )
+                            blockedNavigationViolation = null
+                        },
+                        modifier = Modifier.testTag("in_app_skip_keyword_30s_button")
+                    ) {
+                        Text("Skip Keyword Alert for 30s")
+                    }
                 }
             }
         } else {
@@ -1118,12 +1155,17 @@ fun InAppBrowserScreen(
                             ): Boolean {
                                 val targetUri = request?.url?.toString() ?: return false
                                 if (WhatToProtectItem.EXPLICIT_TEXT_URLS in viewModel.state.value.whatToProtect) {
-                                    val violation = urlScanner.findViolationReason(
+                                    val isKeywordSnoozed = strikeLockoutManager.isKeywordTextSnoozed(
+                                        activePlatform.id,
+                                        android.os.SystemClock.elapsedRealtime()
+                                    )
+                                    val violation = urlScanner.findViolation(
                                         rawInput = targetUri,
-                                        isUrlBarNode = true
+                                        isUrlBarNode = true,
+                                        isKeywordSnoozed = isKeywordSnoozed
                                     )
                                     if (violation != null) {
-                                        blockedNavigationReason = violation
+                                        blockedNavigationViolation = violation
                                         return true
                                     }
                                 }
@@ -1207,7 +1249,7 @@ fun InAppBrowserScreen(
             currentUrl = currentUrl,
             onSelectPlatform = { selected ->
                 viewModel.setActivePlatform(selected.id)
-                blockedNavigationReason = null
+                blockedNavigationViolation = null
                 currentUrl = selected.url
                 webViewRef?.loadUrl(selected.url)
                 showPlatformsSheet = false
@@ -1231,7 +1273,8 @@ private fun injectDomProtectionScript(webView: WebView?, state: AmnGazeState) {
         whatToProtect = state.whatToProtect,
         blurStyle = state.haramBlurOverlayStyle,
         strengthPx = state.inAppBlurStrengthPx,
-        feedControlConfig = state.feedControlConfig
+        feedControlConfig = state.feedControlConfig,
+        preBlurNewMediaUntilScanned = state.preBlurNewMediaUntilScanned
     )
     wv.evaluateJavascript(script, null)
 }
@@ -1481,10 +1524,16 @@ fun DetectionSensitivitySelectorDialog(
 fun BlurStyleSheetDialog(
     currentStyle: HaramBlurOverlayStyle,
     currentStrengthPx: Int,
+    preBlurNewMedia: Boolean = false,
     onUpdateStyle: (HaramBlurOverlayStyle) -> Unit,
     onUpdateStrengthPx: (Int) -> Unit,
+    onTogglePreBlurNewMedia: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
+    val strength10 = ((currentStrengthPx + 1) / 2).coerceIn(1, 10)
+    val solidnessPct = HaramBlurFilterLogic.computeOverlaySolidnessPercent(strength10)
+    val solidnessDesc = if (solidnessPct >= 100) "100% Solid (No See-Through)" else "${solidnessPct}% Solidness"
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Blur Style & Effect Strength", fontWeight = FontWeight.Bold) },
@@ -1505,7 +1554,7 @@ fun BlurStyleSheetDialog(
                     }
                 }
                 Text(
-                    "Effect Strength: ${currentStrengthPx}px",
+                    "Effect Strength: ${strength10}/10 (${currentStrengthPx}px • $solidnessDesc)",
                     fontWeight = FontWeight.SemiBold
                 )
                 Slider(
@@ -1514,6 +1563,28 @@ fun BlurStyleSheetDialog(
                     valueRange = 1f..20f,
                     steps = 18
                 )
+                HorizontalDivider()
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onTogglePreBlurNewMedia(!preBlurNewMedia) }
+                        .testTag("dialog_preblur_new_media_toggle"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Pre-Blur New Media Until Scanned", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Blur newly appearing images and videos until AI verification finishes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = preBlurNewMedia,
+                        onCheckedChange = { onTogglePreBlurNewMedia(it) }
+                    )
+                }
             }
         },
         confirmButton = {

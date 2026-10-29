@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -45,7 +46,8 @@ class HaramBlurProjectionService : Service() {
 
         private const val CAPTURE_WIDTH = 360
         private const val CAPTURE_HEIGHT = 640
-        private const val MIN_FRAME_INTERVAL_MS = 125L // ~8 FPS max to keep CPU cool
+        private const val MIN_FRAME_INTERVAL_MS = 85L // ~12 FPS responsive real-time cadence
+        private const val SCROLL_FRAME_INTERVAL_MS = 50L
 
         fun startProjection(context: Context, resultCode: Int, data: Intent) {
             val intent = Intent(context, HaramBlurProjectionService::class.java).apply {
@@ -83,6 +85,9 @@ class HaramBlurProjectionService : Service() {
     private val isFrameProcessing = AtomicBoolean(false)
     private var lastFrameProcessedTimeMs: Long = 0L
     private var previousExteriorSig: FloatArray? = null
+    private var lastUnoccludedFrame: Bitmap? = null
+    private val patchRestoreCanvas = android.graphics.Canvas()
+    private val patchRect = android.graphics.Rect()
 
     override fun onCreate() {
         super.onCreate()
@@ -197,7 +202,9 @@ class HaramBlurProjectionService : Service() {
         } ?: return
 
         val now = SystemClock.elapsedRealtime()
-        if ((now - lastFrameProcessedTimeMs) < MIN_FRAME_INTERVAL_MS ||
+        val scrollOccurred = HaramBlurRuntimeBus.consumeScrollFlag()
+        val minInterval = if (scrollOccurred) SCROLL_FRAME_INTERVAL_MS else MIN_FRAME_INTERVAL_MS
+        if ((now - lastFrameProcessedTimeMs) < minInterval ||
             !isFrameProcessing.compareAndSet(false, true)
         ) {
             image.close()
@@ -273,9 +280,9 @@ class HaramBlurProjectionService : Service() {
             ) { HaramBlurOverlayStyle.BLUR }
             val effectStrength = prefs.getInt(PREFS_KEY_HARAMBLUR_EFFECT_STRENGTH, 10).coerceIn(1, 10)
 
-            val scrollOccurred = HaramBlurRuntimeBus.consumeScrollFlag()
-            if (scrollOccurred) {
-                regionTracker.onScrollDetected(HaramBlurRuntimeBus.lastScrollDeltaY)
+            val scrollDeltaY = HaramBlurRuntimeBus.lastScrollDeltaY
+            if (scrollOccurred && kotlin.math.abs(scrollDeltaY) > 0.005f) {
+                regionTracker.onScrollDetected(scrollDeltaY)
             }
 
             val currentLockedRects = regionTracker.getActiveRegions().map { it.rectF }
@@ -283,15 +290,81 @@ class HaramBlurProjectionService : Service() {
             val exteriorDiff = regionTracker.computeExteriorLumaDiff(previousExteriorSig, currentExteriorSig)
             previousExteriorSig = currentExteriorSig
 
-            // Only run heavy neural inference if exterior scene changed (`exteriorDiff >= 0.04f`),
-            // a scroll occurred, or no regions are currently tracked
-            val candidates = if (currentLockedRects.isNotEmpty() &&
+            // Restore unoccluded pixels under existing active overlay boxes when exterior scene is relatively steady
+            // so RegionalBlurOverlayView never blinds the AI detector to the face/skin underneath
+            val cleanRef = lastUnoccludedFrame
+            if (cleanRef != null && !cleanRef.isRecycled && currentLockedRects.isNotEmpty() && !scrollOccurred && exteriorDiff < 0.14f) {
+                patchRestoreCanvas.setBitmap(frameBitmap)
+                val bw = frameBitmap.width
+                val bh = frameBitmap.height
+                for (r in currentLockedRects) {
+                    patchRect.set(
+                        (r.left * bw).toInt().coerceIn(0, bw - 1),
+                        (r.top * bh).toInt().coerceIn(0, bh - 1),
+                        (r.right * bw).toInt().coerceIn(1, bw),
+                        (r.bottom * bh).toInt().coerceIn(1, bh)
+                    )
+                    if (patchRect.width() > 4 && patchRect.height() > 4) {
+                        patchRestoreCanvas.drawBitmap(cleanRef, patchRect, patchRect, null)
+                    }
+                }
+            }
+
+            // Cache current clean/restored frame for next cycle's unoccluded patch restoration.
+            // Exclude current active overlay boxes so drawn censor boxes are never recorded into the clean cache!
+            if (lastUnoccludedFrame == null || lastUnoccludedFrame?.isRecycled == true) {
+                lastUnoccludedFrame = frameBitmap.copy(Bitmap.Config.ARGB_8888, true)
+            } else {
+                patchRestoreCanvas.setBitmap(lastUnoccludedFrame!!)
+                if (currentLockedRects.isEmpty()) {
+                    patchRestoreCanvas.drawBitmap(frameBitmap, 0f, 0f, null)
+                } else {
+                    patchRestoreCanvas.save()
+                    val bwF = frameBitmap.width.toFloat()
+                    val bhF = frameBitmap.height.toFloat()
+                    for (r in currentLockedRects) {
+                        val excludeRect = RectF(r.left * bwF, r.top * bhF, r.right * bwF, r.bottom * bhF)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            patchRestoreCanvas.clipOutRect(excludeRect)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            patchRestoreCanvas.clipRect(excludeRect, android.graphics.Region.Op.DIFFERENCE)
+                        }
+                    }
+                    patchRestoreCanvas.drawBitmap(frameBitmap, 0f, 0f, null)
+                    patchRestoreCanvas.restore()
+                }
+            }
+
+            val rawCandidates = if (currentLockedRects.isNotEmpty() &&
                 !scrollOccurred &&
                 exteriorDiff < HaramBlurFilterLogic.EXTERIOR_STATIONARY_DIFF_THRESHOLD
             ) {
                 emptyList()
             } else {
                 moderationEngine.detectRegionalBlurCandidates(frameBitmap)
+            }
+
+            val candidates = rawCandidates.map { cand ->
+                if (cand.previewPatch == null) {
+                    val bw = frameBitmap.width
+                    val bh = frameBitmap.height
+                    val cl = (cand.normalizedRect.left * bw).toInt().coerceIn(0, bw - 2)
+                    val ct = (cand.normalizedRect.top * bh).toInt().coerceIn(0, bh - 2)
+                    val cw = ((cand.normalizedRect.right - cand.normalizedRect.left) * bw).toInt().coerceIn(2, bw - cl)
+                    val ch = ((cand.normalizedRect.bottom - cand.normalizedRect.top) * bh).toInt().coerceIn(2, bh - ct)
+                    val patch = try {
+                        val sub = Bitmap.createBitmap(frameBitmap, cl, ct, cw, ch)
+                        val thumb = Bitmap.createScaledBitmap(sub, 8, 8, true)
+                        if (thumb !== sub) sub.recycle()
+                        thumb
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    cand.copy(previewPatch = patch)
+                } else {
+                    cand
+                }
             }
 
             val updatedRegions = regionTracker.updateRegions(
@@ -341,6 +414,12 @@ class HaramBlurProjectionService : Service() {
         } catch (_: Throwable) {
         }
         mediaProjection = null
+
+        try {
+            lastUnoccludedFrame?.recycle()
+        } catch (_: Throwable) {
+        }
+        lastUnoccludedFrame = null
 
         regionTracker.clearAll()
         previousExteriorSig = null

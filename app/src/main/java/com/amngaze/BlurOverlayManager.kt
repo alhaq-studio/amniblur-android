@@ -318,7 +318,7 @@ class BlurOverlayManager(
             }
 
             val unblurBtn = Button(context).apply {
-                text = "False Positive - Unblur for 30s"
+                text = "Skip Keyword Alert for 30s"
                 isAllCaps = false
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setTextColor(Color.parseColor("#E2E8F0"))
@@ -453,7 +453,7 @@ class BlurOverlayManager(
         strikeStatus: String,
         allowFalsePositiveUnblur: Boolean,
         primaryActionLabel: String = "Leave Page Safely",
-        secondaryActionLabel: String = "False Positive - Unblur for 30s"
+        secondaryActionLabel: String = "Skip Keyword Alert for 30s"
     ) {
         if (!isAttached) {
             attachPreAllocatedShield()

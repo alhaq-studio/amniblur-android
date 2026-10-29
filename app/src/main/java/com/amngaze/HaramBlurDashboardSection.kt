@@ -598,6 +598,8 @@ fun HaramBlurMasterModuleCard(
 
                         Spacer(modifier = Modifier.height(14.dp))
                         val blockSizeDp = HaramBlurFilterLogic.computePixelationBlockSizeDp(state.haramBlurEffectStrength)
+                        val solidnessPct = HaramBlurFilterLogic.computeOverlaySolidnessPercent(state.haramBlurEffectStrength)
+                        val solidnessLabel = if (solidnessPct >= 100) "100% Solid (No See-Through)" else "${solidnessPct}% Density"
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -609,7 +611,7 @@ fun HaramBlurMasterModuleCard(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Block Scale: ${blockSizeDp.roundToInt()}dp",
+                                text = "$solidnessLabel • ${blockSizeDp.roundToInt()}dp",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary,
                                 fontWeight = FontWeight.Bold
@@ -626,6 +628,42 @@ fun HaramBlurMasterModuleCard(
                                 .fillMaxWidth()
                                 .testTag("haramblur_strength_slider")
                         )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    runWithPinGate { viewModel.togglePreBlurNewMediaUntilScanned() }
+                                }
+                                .testTag("haramblur_preblur_new_media_row"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Pre-Blur New Images & Frames",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Keep newly appearing photos and video frames blurred until AI detection confirms they are safe.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Switch(
+                                checked = state.preBlurNewMediaUntilScanned,
+                                onCheckedChange = {
+                                    runWithPinGate { viewModel.setPreBlurNewMediaUntilScanned(it) }
+                                },
+                                modifier = Modifier.testTag("haramblur_preblur_new_media_switch")
+                            )
+                        }
                     }
                 }
             }

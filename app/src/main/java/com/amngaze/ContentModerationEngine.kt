@@ -50,29 +50,55 @@ class ContentModerationEngine(private val context: Context) {
 
         /**
          * Maps user sensitivity (`0.20f..0.95f`, where higher sensitivity = lower threshold required to trigger):
-         * - At 25% Sensitivity (`0.25f`, Strict):     threshold = `0.62f`
-         * - At 50% Sensitivity (`0.50f`, Balanced):   threshold = `0.50f`
-         * - At 75% Sensitivity (`0.75f`, Aggressive): threshold = `0.38f`
-         * - At 95% Sensitivity (`0.95f`, Maximum):    threshold = `0.28f`
+         * - At 20% Sensitivity (`0.20f`): threshold = `0.78f`
+         * - At 25% Sensitivity (`0.25f`): threshold = `0.74f`
+         * - At 50% Sensitivity (`0.50f`): threshold = `0.60f`
+         * - At 75% Sensitivity (`0.75f`): threshold = `0.48f`
+         * - At 95% Sensitivity (`0.95f`): threshold = `0.38f`
          */
         fun confidenceThresholdForSensitivity(sensitivity: Float): Float {
             val s = sensitivity.coerceIn(0.20f, 0.95f)
-            val threshold = if (s <= 0.75f) {
-                0.74f - (0.48f * s)
-            } else {
-                0.38f - ((s - 0.75f) * 0.50f)
-            }
-            return threshold.coerceIn(0.28f, 0.66f)
+            return when {
+                s <= 0.25f -> {
+                    0.78f - ((s - 0.20f) / 0.05f) * 0.04f
+                }
+                s <= 0.50f -> {
+                    0.74f - ((s - 0.25f) / 0.25f) * 0.14f
+                }
+                s <= 0.75f -> {
+                    0.60f - ((s - 0.50f) / 0.25f) * 0.12f
+                }
+                else -> {
+                    0.48f - ((s - 0.75f) / 0.20f) * 0.10f
+                }
+            }.coerceIn(0.38f, 0.78f)
+        }
+
+        /**
+         * Stage 1 & Fix 2: Automatic internal model routing for the Explicit / Adult Content Blocker.
+         * Uses `QUANTIZED_NSFW` (`nsfw_mobilenet_v2_140_224_quantized.tflite`) exclusively for
+         * 5-class NSFW scoring so `GENDER_FILTER` and uncalibrated `DEFAULT_NSFW` never poison
+         * text/UI pages.
+         */
+        fun resolveAdultBlockerModel(requestedModel: ModerationModelType = ModerationModelType.QUANTIZED_NSFW): ModerationModelType {
+            return ModerationModelType.QUANTIZED_NSFW
+        }
+
+        fun resolveAdultBlockerModelType(requestedModel: ModerationModelType = ModerationModelType.QUANTIZED_NSFW): ModerationModelType {
+            return resolveAdultBlockerModel(requestedModel)
         }
 
         /**
          * Computes the 5-class MobileNetV2 NSFW violation score (`[0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy`).
-         * - Returns `0.0f` (SAFE) when `neutral + drawings > 0.78f` to prevent false triggers on plain text/UI chrome.
-         * - Otherwise returns `maxOf(porn + hentai, porn + hentai + sexy * 0.85f)` when [includeSexyScore] is true.
+         * - If [skinRatio] < 0.05f and [pornProb] < 0.82f, returns `0.0f` (SAFE).
+         * - If (neutralProb + drawingsProb) >= 0.50f, returns `0.0f` (SAFE) to protect text & UI chrome.
+         * - Only includes hentaiProb when hentaiProb >= 0.65f AND neutralProb < 0.20f AND skinRatio >= 0.08f.
+         * - If [includeSexyScore] is false, returns explicitScore only.
          */
         fun computeFiveClassNsfwScore(
             probabilities: FloatArray,
-            includeSexyScore: Boolean = true
+            includeSexyScore: Boolean = true,
+            skinRatio: Float = 1.0f
         ): Float {
             if (probabilities.size < 5) {
                 return if (probabilities.size >= 2) {
@@ -90,21 +116,236 @@ class ContentModerationEngine(private val context: Context) {
             val pornProb = probabilities[3].coerceIn(0f, 1f)
             val sexyProb = probabilities[4].coerceIn(0f, 1f)
 
-            // Safe UI / text screen guard
-            if ((neutralProb + drawingsProb) > SAFE_UI_NEUTRAL_DRAWINGS_THRESHOLD &&
-                pornProb < 0.25f &&
-                hentaiProb < 0.25f
-            ) {
+            // Fix 2: Skin-ratio gate: if skinRatio < 0.05f and pornProb < 0.82f, return 0.0f (SAFE)
+            if (skinRatio < 0.05f && pornProb < 0.82f) {
                 return 0.0f
             }
 
-            val explicitScore = pornProb + hentaiProb
+            // Fix 2: Safe UI guard: if (neutralProb + drawingsProb) >= 0.50f, return 0.0f (SAFE)
+            if ((neutralProb + drawingsProb) >= 0.50f) {
+                return 0.0f
+            }
+
+            // Fix 2: Only include hentaiProb when hentaiProb >= 0.65f AND neutralProb < 0.20f AND skinRatio >= 0.08f
+            val effectiveHentai = if (hentaiProb >= 0.65f && neutralProb < 0.20f && skinRatio >= 0.08f) {
+                hentaiProb
+            } else {
+                0.0f
+            }
+
+            val explicitScore = (pornProb + effectiveHentai).coerceIn(0f, 1f)
             val combinedNsfwScore = if (includeSexyScore) {
-                pornProb + hentaiProb + (sexyProb * SEXY_CLASS_WEIGHT)
+                (pornProb + effectiveHentai + (sexyProb * SEXY_CLASS_WEIGHT)).coerceIn(0f, 1f)
             } else {
                 explicitScore
             }
             return maxOf(explicitScore, combinedNsfwScore).coerceIn(0f, 1f)
+        }
+
+        private val FLOAT_ZERO_TO_ONE_LUT = FloatArray(256) { it / 255.0f }
+        private val FLOAT_MINUS1_TO_1_LUT = FloatArray(256) { (it - 127.5f) / 127.5f }
+
+        /**
+         * Separates mandatory hardcore pornography/hentai confidence (`porn + hentai`) from
+         * gender-gated revealing skin confidence (`sexy * 0.85f`) so opposite-gender skin
+         * never triggers false-positive blurs when a specific gender (`FEMALE` or `MALE`) is selected.
+         */
+        fun computeFiveClassBreakdown(
+            probabilities: FloatArray,
+            skinRatio: Float = 1.0f
+        ): Triple<Float, Float, Float> {
+            if (probabilities.size < 5) {
+                val twoClass = if (probabilities.size >= 2) {
+                    probabilities[1].coerceIn(0f, 1f)
+                } else if (probabilities.isNotEmpty()) {
+                    probabilities[0].coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+                return Triple(twoClass, twoClass, twoClass)
+            }
+
+            val drawingsProb = probabilities[0].coerceIn(0f, 1f)
+            val hentaiProb = probabilities[1].coerceIn(0f, 1f)
+            val neutralProb = probabilities[2].coerceIn(0f, 1f)
+            val pornProb = probabilities[3].coerceIn(0f, 1f)
+            val sexyProb = probabilities[4].coerceIn(0f, 1f)
+
+            if (skinRatio < 0.05f && pornProb < 0.82f) {
+                return Triple(0f, 0f, 0f)
+            }
+
+            if ((neutralProb + drawingsProb) >= 0.50f) {
+                return Triple(0f, 0f, 0f)
+            }
+
+            val effectiveHentai = if (hentaiProb >= 0.65f && neutralProb < 0.20f && skinRatio >= 0.08f) {
+                hentaiProb
+            } else {
+                0.0f
+            }
+
+            val explicitPornHentai = (pornProb + effectiveHentai).coerceIn(0f, 1f)
+            val revealingSkin = (sexyProb * SEXY_CLASS_WEIGHT).coerceIn(0f, 1f)
+            val combined = (explicitPornHentai + revealingSkin).coerceIn(0f, 1f)
+            return Triple(explicitPornHentai, revealingSkin, combined)
+        }
+
+        /**
+         * Computes a tight bounding box around the actual skin pixels within a candidate cell/crop,
+         * sampled on a 16x16 grid and padded by [paddingFraction] (+8%) of the cell dimension.
+         */
+        fun computeTightSkinBoundingBox(
+            bitmap: Bitmap,
+            cellNormRect: android.graphics.RectF,
+            paddingFraction: Float = 0.08f
+        ): android.graphics.RectF {
+            val w = bitmap.width
+            val h = bitmap.height
+            if (w <= 4 || h <= 4) return cellNormRect
+
+            val steps = 16
+            var minGx = steps
+            var maxGx = -1
+            var minGy = steps
+            var maxGy = -1
+
+            for (gy in 0 until steps) {
+                val y = ((gy + 0.5f) * h / steps).toInt().coerceIn(0, h - 1)
+                for (gx in 0 until steps) {
+                    val x = ((gx + 0.5f) * w / steps).toInt().coerceIn(0, w - 1)
+                    val pixel = bitmap.getPixel(x, y)
+                    val r = (pixel shr 16) and 0xFF
+                    val g = (pixel shr 8) and 0xFF
+                    val b = pixel and 0xFF
+                    val rgbSkin = r > 60 && g > 35 && b > 18 &&
+                        r > g && r > b && (r - minOf(g, b)) > 12 && kotlin.math.abs(r - g) > 10
+                    if (rgbSkin) {
+                        val cb = 128 - (0.168736f * r) - (0.331264f * g) + (0.5f * b)
+                        val cr = 128 + (0.5f * r) - (0.418688f * g) - (0.081312f * b)
+                        if (cb in 75f..138f && cr in 130f..178f) {
+                            if (gx < minGx) minGx = gx
+                            if (gx > maxGx) maxGx = gx
+                            if (gy < minGy) minGy = gy
+                            if (gy > maxGy) maxGy = gy
+                        }
+                    }
+                }
+            }
+
+            if (maxGx < minGx || maxGy < minGy) {
+                return cellNormRect
+            }
+
+            val cellW = cellNormRect.width()
+            val cellH = cellNormRect.height()
+
+            val normLeftInCell = (minGx.toFloat() / steps.toFloat()) - paddingFraction
+            val normRightInCell = ((maxGx + 1).toFloat() / steps.toFloat()) + paddingFraction
+            val normTopInCell = (minGy.toFloat() / steps.toFloat()) - paddingFraction
+            val normBottomInCell = ((maxGy + 1).toFloat() / steps.toFloat()) + paddingFraction
+
+            val absLeft = (cellNormRect.left + normLeftInCell.coerceIn(0f, 1f) * cellW).coerceIn(0f, 1f)
+            val absRight = (cellNormRect.left + normRightInCell.coerceIn(0f, 1f) * cellW).coerceIn(0f, 1f)
+            val absTop = (cellNormRect.top + normTopInCell.coerceIn(0f, 1f) * cellH).coerceIn(0f, 1f)
+            val absBottom = (cellNormRect.top + normBottomInCell.coerceIn(0f, 1f) * cellH).coerceIn(0f, 1f)
+
+            return if (absRight > absLeft + 0.02f && absBottom > absTop + 0.02f) {
+                android.graphics.RectF(absLeft, absTop, absRight, absBottom)
+            } else {
+                cellNormRect
+            }
+        }
+
+        fun mergeOverlappingCandidates(candidates: List<CandidateBlurBox>): List<CandidateBlurBox> {
+            if (candidates.size <= 1) return candidates
+            val merged = mutableListOf<CandidateBlurBox>()
+            val visited = BooleanArray(candidates.size)
+
+            for (i in candidates.indices) {
+                if (visited[i]) continue
+                var current = candidates[i]
+                visited[i] = true
+
+                for (j in i + 1 until candidates.size) {
+                    if (visited[j]) continue
+                    val other = candidates[j]
+                    val rectIntersect = android.graphics.RectF.intersects(current.normalizedRect, other.normalizedRect)
+                    val iouVal = computeCandidateIou(current.normalizedRect, other.normalizedRect)
+                    val canMergeGender = current.gender == other.gender ||
+                        current.gender == DetectedGender.UNKNOWN ||
+                        other.gender == DetectedGender.UNKNOWN
+
+                    if ((rectIntersect || iouVal >= 0.15f) && canMergeGender) {
+                        visited[j] = true
+                        val newLeft = minOf(current.normalizedRect.left, other.normalizedRect.left)
+                        val newTop = minOf(current.normalizedRect.top, other.normalizedRect.top)
+                        val newRight = maxOf(current.normalizedRect.right, other.normalizedRect.right)
+                        val newBottom = maxOf(current.normalizedRect.bottom, other.normalizedRect.bottom)
+                        val combinedGender = if (current.gender != DetectedGender.UNKNOWN) current.gender else other.gender
+                        current = current.copy(
+                            normalizedRect = android.graphics.RectF(newLeft, newTop, newRight, newBottom),
+                            gender = combinedGender,
+                            genderConfidence = maxOf(current.genderConfidence, other.genderConfidence),
+                            nsfwConfidence = maxOf(current.nsfwConfidence, other.nsfwConfidence),
+                            explicitPornNudityConfidence = maxOf(current.explicitPornNudityConfidence, other.explicitPornNudityConfidence),
+                            revealingSkinConfidence = maxOf(current.revealingSkinConfidence, other.revealingSkinConfidence)
+                        )
+                    }
+                }
+                merged.add(current)
+            }
+            return merged
+        }
+
+        private fun computeCandidateIou(a: android.graphics.RectF, b: android.graphics.RectF): Float {
+            val interLeft = maxOf(a.left, b.left)
+            val interTop = maxOf(a.top, b.top)
+            val interRight = minOf(a.right, b.right)
+            val interBottom = minOf(a.bottom, b.bottom)
+            val interW = (interRight - interLeft).coerceAtLeast(0f)
+            val interH = (interBottom - interTop).coerceAtLeast(0f)
+            val interArea = interW * interH
+            if (interArea <= 0f) return 0f
+            val areaA = (a.right - a.left).coerceAtLeast(0f) * (a.bottom - a.top).coerceAtLeast(0f)
+            val areaB = (b.right - b.left).coerceAtLeast(0f) * (b.bottom - b.top).coerceAtLeast(0f)
+            val union = areaA + areaB - interArea
+            return if (union > 0f) interArea / union else 0f
+        }
+
+        /**
+         * Fast YCbCr/RGB skin-tone pixel fraction estimator on a sparse grid (`16x16`) to verify
+         * whether a region contains actual human skin/face vs. flat UI chrome/landscapes.
+         */
+        fun estimateSkinPixelRatio(bitmap: Bitmap): Float {
+            val w = bitmap.width
+            val h = bitmap.height
+            if (w <= 4 || h <= 4) return 0f
+            val steps = 16
+            var skinCount = 0
+            var total = 0
+            for (gy in 0 until steps) {
+                val y = ((gy + 0.5f) * h / steps).toInt().coerceIn(0, h - 1)
+                for (gx in 0 until steps) {
+                    val x = ((gx + 0.5f) * w / steps).toInt().coerceIn(0, w - 1)
+                    val pixel = bitmap.getPixel(x, y)
+                    val r = (pixel shr 16) and 0xFF
+                    val g = (pixel shr 8) and 0xFF
+                    val b = pixel and 0xFF
+                    total++
+                    // Standard RGB + YCbCr human skin locus across diverse skin tones
+                    val rgbSkin = r > 60 && g > 35 && b > 18 &&
+                        r > g && r > b && (r - minOf(g, b)) > 12 && kotlin.math.abs(r - g) > 10
+                    if (rgbSkin) {
+                        val cb = 128 - (0.168736f * r) - (0.331264f * g) + (0.5f * b)
+                        val cr = 128 + (0.5f * r) - (0.418688f * g) - (0.081312f * b)
+                        if (cb in 75f..138f && cr in 130f..178f) {
+                            skinCount++
+                        }
+                    }
+                }
+            }
+            return if (total > 0) skinCount.toFloat() / total.toFloat() else 0f
         }
 
         /**
@@ -256,6 +497,15 @@ class ContentModerationEngine(private val context: Context) {
     private val interpreters = java.util.EnumMap<ModerationModelType, Interpreter>(ModerationModelType::class.java)
     private val gpuDelegates = java.util.EnumMap<ModerationModelType, GpuDelegate>(ModerationModelType::class.java)
 
+    // Reusable pre-allocated buffers keyed by inputSize / capacity to eliminate per-crop GC churn
+    private val reusableInputBuffers = HashMap<Int, ByteBuffer>()
+    private val reusableOutputBuffers = HashMap<Int, ByteBuffer>()
+    private val reusablePixelArrays = HashMap<Int, IntArray>()
+    private val reusableScaledBitmaps = HashMap<Int, Bitmap>()
+    private val reusableCanvas = android.graphics.Canvas()
+    private val scalingPaint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+    private val scalingDestRect = android.graphics.Rect()
+
     @Synchronized
     private fun getOrLoadInterpreter(modelType: ModerationModelType): Interpreter? {
         interpreters[modelType]?.let { return it }
@@ -359,65 +609,134 @@ class ContentModerationEngine(private val context: Context) {
         inputDataType: DataType,
         inputScale: Float = 0f,
         inputZeroPoint: Int = 0,
-        useMinusOneToOneRange: Boolean = false
+        useMinusOneToOneRange: Boolean = false,
+        useCaffeBgrMeanSubtraction: Boolean = false
     ): ByteBuffer {
-        val scaledBitmap = if (bitmap.width == inputSize && bitmap.height == inputSize) {
-            bitmap
+        return preprocessBitmapInternal(
+            bitmap = bitmap,
+            inputSize = inputSize,
+            inputDataType = inputDataType,
+            inputScale = inputScale,
+            inputZeroPoint = inputZeroPoint,
+            useMinusOneToOneRange = useMinusOneToOneRange,
+            useCaffeBgrMeanSubtraction = useCaffeBgrMeanSubtraction,
+            reuseBuffers = false
+        )
+    }
+
+    @Synchronized
+    private fun preprocessBitmapInternal(
+        bitmap: Bitmap,
+        inputSize: Int,
+        inputDataType: DataType,
+        inputScale: Float,
+        inputZeroPoint: Int,
+        useMinusOneToOneRange: Boolean,
+        useCaffeBgrMeanSubtraction: Boolean = false,
+        reuseBuffers: Boolean
+    ): ByteBuffer {
+        val targetBitmap: Bitmap
+        var tempAllocatedBitmap: Bitmap? = null
+
+        if (bitmap.width == inputSize && bitmap.height == inputSize && bitmap.config == Bitmap.Config.ARGB_8888) {
+            targetBitmap = bitmap
+        } else if (reuseBuffers) {
+            val cachedBmp = reusableScaledBitmaps.getOrPut(inputSize) {
+                Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+            }
+            reusableCanvas.setBitmap(cachedBmp)
+            scalingDestRect.set(0, 0, inputSize, inputSize)
+            reusableCanvas.drawBitmap(bitmap, null, scalingDestRect, scalingPaint)
+            targetBitmap = cachedBmp
         } else {
-            Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+            val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+            if (scaled !== bitmap) {
+                tempAllocatedBitmap = scaled
+            }
+            targetBitmap = scaled
         }
+
         val isByteInput = (inputDataType == DataType.UINT8 || inputDataType == DataType.INT8)
         val numBytesPerChannel = if (isByteInput) 1 else 4
-        val byteBuffer = ByteBuffer.allocateDirect(numBytesPerChannel * inputSize * inputSize * 3)
-        byteBuffer.order(ByteOrder.nativeOrder())
+        val requiredCapacity = numBytesPerChannel * inputSize * inputSize * 3
 
-        val intValues = IntArray(inputSize * inputSize)
-        scaledBitmap.getPixels(intValues, 0, scaledBitmap.width, 0, 0, scaledBitmap.width, scaledBitmap.height)
+        val byteBuffer = if (reuseBuffers) {
+            reusableInputBuffers.getOrPut(requiredCapacity) {
+                ByteBuffer.allocateDirect(requiredCapacity).apply {
+                    order(ByteOrder.nativeOrder())
+                }
+            }
+        } else {
+            ByteBuffer.allocateDirect(requiredCapacity).apply {
+                order(ByteOrder.nativeOrder())
+            }
+        }
+
+        val pixelCount = inputSize * inputSize
+        val intValues = if (reuseBuffers) {
+            reusablePixelArrays.getOrPut(pixelCount) { IntArray(pixelCount) }
+        } else {
+            IntArray(pixelCount)
+        }
+
+        targetBitmap.getPixels(intValues, 0, inputSize, 0, 0, inputSize, inputSize)
 
         byteBuffer.rewind()
-        for (pixelValue in intValues) {
-            val r = ((pixelValue shr 16) and 0xFF)
-            val g = ((pixelValue shr 8) and 0xFF)
-            val b = (pixelValue and 0xFF)
-
-            when (inputDataType) {
-                DataType.UINT8 -> {
-                    byteBuffer.put(r.toByte())
-                    byteBuffer.put(g.toByte())
-                    byteBuffer.put(b.toByte())
+        when (inputDataType) {
+            DataType.UINT8 -> {
+                for (i in 0 until pixelCount) {
+                    val pixelValue = intValues[i]
+                    byteBuffer.put(((pixelValue shr 16) and 0xFF).toByte())
+                    byteBuffer.put(((pixelValue shr 8) and 0xFF).toByte())
+                    byteBuffer.put((pixelValue and 0xFF).toByte())
                 }
-                DataType.INT8 -> {
-                    if (inputScale > 0f) {
-                        val qr = ((r / 255.0f) / inputScale + inputZeroPoint).roundToInt().coerceIn(-128, 127)
-                        val qg = ((g / 255.0f) / inputScale + inputZeroPoint).roundToInt().coerceIn(-128, 127)
-                        val qb = ((b / 255.0f) / inputScale + inputZeroPoint).roundToInt().coerceIn(-128, 127)
-                        byteBuffer.put(qr.toByte())
-                        byteBuffer.put(qg.toByte())
-                        byteBuffer.put(qb.toByte())
-                    } else {
-                        byteBuffer.put((r - 128).toByte())
-                        byteBuffer.put((g - 128).toByte())
-                        byteBuffer.put((b - 128).toByte())
+            }
+            DataType.INT8 -> {
+                if (inputScale > 0f) {
+                    val invScale = (1f / 255.0f) / inputScale
+                    for (i in 0 until pixelCount) {
+                        val pixelValue = intValues[i]
+                        val r = (pixelValue shr 16) and 0xFF
+                        val g = (pixelValue shr 8) and 0xFF
+                        val b = pixelValue and 0xFF
+                        byteBuffer.put((r * invScale + inputZeroPoint).roundToInt().coerceIn(-128, 127).toByte())
+                        byteBuffer.put((g * invScale + inputZeroPoint).roundToInt().coerceIn(-128, 127).toByte())
+                        byteBuffer.put((b * invScale + inputZeroPoint).roundToInt().coerceIn(-128, 127).toByte())
+                    }
+                } else {
+                    for (i in 0 until pixelCount) {
+                        val pixelValue = intValues[i]
+                        byteBuffer.put((((pixelValue shr 16) and 0xFF) - 128).toByte())
+                        byteBuffer.put((((pixelValue shr 8) and 0xFF) - 128).toByte())
+                        byteBuffer.put(((pixelValue and 0xFF) - 128).toByte())
                     }
                 }
-                else -> {
-                    if (useMinusOneToOneRange) {
-                        byteBuffer.putFloat((r - 127.5f) / 127.5f)
-                        byteBuffer.putFloat((g - 127.5f) / 127.5f)
-                        byteBuffer.putFloat((b - 127.5f) / 127.5f)
-                    } else {
-                        // Standard MobileNetV2 RGB normalized to [0.0f, 1.0f]
-                        byteBuffer.putFloat(r.toFloat() / 255.0f)
-                        byteBuffer.putFloat(g.toFloat() / 255.0f)
-                        byteBuffer.putFloat(b.toFloat() / 255.0f)
+            }
+            else -> {
+                if (useCaffeBgrMeanSubtraction) {
+                    // Caffe ResNet-50 / OpenNSFW BGR mean subtraction: B - 104f, G - 117f, R - 123f
+                    for (i in 0 until pixelCount) {
+                        val pixelValue = intValues[i]
+                        val r = ((pixelValue shr 16) and 0xFF) - 123f
+                        val g = ((pixelValue shr 8) and 0xFF) - 117f
+                        val b = (pixelValue and 0xFF) - 104f
+                        byteBuffer.putFloat(b)
+                        byteBuffer.putFloat(g)
+                        byteBuffer.putFloat(r)
+                    }
+                } else {
+                    val lut = if (useMinusOneToOneRange) FLOAT_MINUS1_TO_1_LUT else FLOAT_ZERO_TO_ONE_LUT
+                    for (i in 0 until pixelCount) {
+                        val pixelValue = intValues[i]
+                        byteBuffer.putFloat(lut[(pixelValue shr 16) and 0xFF])
+                        byteBuffer.putFloat(lut[(pixelValue shr 8) and 0xFF])
+                        byteBuffer.putFloat(lut[pixelValue and 0xFF])
                     }
                 }
             }
         }
 
-        if (scaledBitmap !== bitmap) {
-            scaledBitmap.recycle()
-        }
+        tempAllocatedBitmap?.recycle()
         byteBuffer.rewind()
         return byteBuffer
     }
@@ -482,6 +801,7 @@ class ContentModerationEngine(private val context: Context) {
             }
         }
 
+        val effectiveModel = resolveAdultBlockerModel(modelType)
         val threshold = confidenceThresholdForSensitivity(sensitivity)
         val bitmapToAnalyze = softwareBitmap
             ?: return VisionVerdict(
@@ -489,14 +809,14 @@ class ContentModerationEngine(private val context: Context) {
                 confidence = 0f,
                 threshold = threshold,
                 categoryName = "SAFE",
-                modelType = modelType
+                modelType = effectiveModel
             )
 
         return try {
             classifyScreenMultiCrop(
                 screenBitmap = bitmapToAnalyze,
                 sensitivity = sensitivity,
-                modelType = modelType,
+                modelType = effectiveModel,
                 includeSexyScore = includeSexyScore
             )
         } finally {
@@ -516,17 +836,19 @@ class ContentModerationEngine(private val context: Context) {
     fun classifyScreenMultiCrop(
         screenBitmap: Bitmap,
         sensitivity: Float = 0.5f,
-        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW,
+        modelType: ModerationModelType = ModerationModelType.QUANTIZED_NSFW,
         includeSexyScore: Boolean = true
     ): VisionVerdict {
+        val effectiveModel = resolveAdultBlockerModel(modelType)
         val threshold = confidenceThresholdForSensitivity(sensitivity)
-        val interpreterInstance = getOrLoadInterpreter(modelType)
+        val interpreterInstance = getOrLoadInterpreter(effectiveModel)
+            ?: getOrLoadInterpreter(ModerationModelType.DEFAULT_NSFW)
             ?: return VisionVerdict(
                 isViolation = false,
                 confidence = 0f,
                 threshold = threshold,
                 categoryName = "MODEL_UNAVAILABLE",
-                modelType = modelType
+                modelType = effectiveModel
             )
 
         val inputTensor = interpreterInstance.getInputTensor(0)
@@ -535,7 +857,7 @@ class ContentModerationEngine(private val context: Context) {
 
         val crops = extractMultiCrops(screenBitmap, inputSize)
         if (crops.isEmpty()) {
-            return classifyBitmap(screenBitmap, sensitivity, modelType, includeSexyScore)
+            return classifyBitmap(screenBitmap, sensitivity, effectiveModel, includeSexyScore)
         }
 
         var maxScore = 0f
@@ -547,7 +869,7 @@ class ContentModerationEngine(private val context: Context) {
                     interpreterInstance = interpreterInstance,
                     cropBitmap = crop,
                     threshold = threshold,
-                    modelType = modelType,
+                    modelType = effectiveModel,
                     includeSexyScore = includeSexyScore,
                     cropIndex = index
                 )
@@ -565,7 +887,7 @@ class ContentModerationEngine(private val context: Context) {
                 confidence = 0f,
                 threshold = threshold,
                 categoryName = "SAFE",
-                modelType = modelType
+                modelType = effectiveModel
             )
         } finally {
             for (crop in crops) {
@@ -583,24 +905,26 @@ class ContentModerationEngine(private val context: Context) {
     fun classifyBitmap(
         bitmap: Bitmap,
         sensitivity: Float = 0.5f,
-        modelType: ModerationModelType = ModerationModelType.DEFAULT_NSFW,
+        modelType: ModerationModelType = ModerationModelType.QUANTIZED_NSFW,
         includeSexyScore: Boolean = true
     ): VisionVerdict {
+        val effectiveModel = resolveAdultBlockerModel(modelType)
         val threshold = confidenceThresholdForSensitivity(sensitivity)
-        val interpreterInstance = getOrLoadInterpreter(modelType)
+        val interpreterInstance = getOrLoadInterpreter(effectiveModel)
+            ?: getOrLoadInterpreter(ModerationModelType.DEFAULT_NSFW)
             ?: return VisionVerdict(
                 isViolation = false,
                 confidence = 0f,
                 threshold = threshold,
                 categoryName = "MODEL_UNAVAILABLE",
-                modelType = modelType
+                modelType = effectiveModel
             )
 
         return classifySingleCropInternal(
             interpreterInstance = interpreterInstance,
             cropBitmap = bitmap,
             threshold = threshold,
-            modelType = modelType,
+            modelType = effectiveModel,
             includeSexyScore = includeSexyScore,
             cropIndex = 0
         )
@@ -614,6 +938,18 @@ class ContentModerationEngine(private val context: Context) {
         includeSexyScore: Boolean,
         cropIndex: Int
     ): VisionVerdict {
+        val skinRatio = estimateSkinPixelRatio(cropBitmap)
+        // Fix 2: If skinRatio < 0.045f, short-circuit and return SAFE immediately without running LiteRT inference
+        if (skinRatio < 0.045f) {
+            return VisionVerdict(
+                isViolation = false,
+                confidence = 0f,
+                threshold = threshold,
+                categoryName = "SAFE",
+                modelType = modelType
+            )
+        }
+
         return try {
             val inputTensor = interpreterInstance.getInputTensor(0)
             val inputShape = inputTensor.shape()
@@ -636,29 +972,16 @@ class ContentModerationEngine(private val context: Context) {
                 outputTensor = outputTensor,
                 outputDataType = outputDataType,
                 numClasses = numClasses,
-                useMinusOneToOneRange = false
+                useMinusOneToOneRange = false,
+                useCaffeBgrMeanSubtraction = (modelType == ModerationModelType.DEFAULT_NSFW)
             )
 
             val score: Float = if (numClasses >= 5) {
-                computeFiveClassNsfwScore(probabilities, includeSexyScore)
+                computeFiveClassNsfwScore(probabilities, includeSexyScore, skinRatio)
             } else if (numClasses == 2) {
-                var bestTwoClassScore = probabilities[1].coerceIn(0f, 1f)
-                if (inputDataType == DataType.FLOAT32 && bestTwoClassScore < threshold) {
-                    val altProbs = runInferencePass(
-                        interpreterInstance = interpreterInstance,
-                        cropBitmap = cropBitmap,
-                        inputSize = inputSize,
-                        inputDataType = inputDataType,
-                        inputScale = inQParams.scale,
-                        inputZeroPoint = inQParams.zeroPoint,
-                        outputTensor = outputTensor,
-                        outputDataType = outputDataType,
-                        numClasses = numClasses,
-                        useMinusOneToOneRange = true
-                    )
-                    bestTwoClassScore = maxOf(bestTwoClassScore, altProbs[1].coerceIn(0f, 1f))
-                }
-                bestTwoClassScore
+                // Stage 3.3: Single-pass execution by default; never run redundant second ALT_FLOAT pass
+                // on safe crops.
+                probabilities[1].coerceIn(0f, 1f)
             } else {
                 probabilities[0].coerceIn(0f, 1f)
             }
@@ -673,12 +996,6 @@ class ContentModerationEngine(private val context: Context) {
             } else {
                 "SAFE"
             }
-
-            Log.d(
-                TAG,
-                "LiteRT crop[$cropIndex] ($modelType, inType=$inputDataType, outType=$outputDataType, classes=$numClasses): " +
-                    "probs=${probabilities.contentToString()} -> score=$score, threshold=$threshold, violation=$isViolation"
-            )
 
             VisionVerdict(
                 isViolation = isViolation,
@@ -709,15 +1026,18 @@ class ContentModerationEngine(private val context: Context) {
         outputTensor: org.tensorflow.lite.Tensor,
         outputDataType: DataType,
         numClasses: Int,
-        useMinusOneToOneRange: Boolean
+        useMinusOneToOneRange: Boolean,
+        useCaffeBgrMeanSubtraction: Boolean = false
     ): FloatArray {
-        val inputBuffer = preprocessBitmap(
+        val inputBuffer = preprocessBitmapInternal(
             bitmap = cropBitmap,
             inputSize = inputSize,
             inputDataType = inputDataType,
             inputScale = inputScale,
             inputZeroPoint = inputZeroPoint,
-            useMinusOneToOneRange = useMinusOneToOneRange
+            useMinusOneToOneRange = useMinusOneToOneRange,
+            useCaffeBgrMeanSubtraction = useCaffeBgrMeanSubtraction,
+            reuseBuffers = true
         )
 
         val probabilities = FloatArray(numClasses)
@@ -728,8 +1048,13 @@ class ContentModerationEngine(private val context: Context) {
                 probabilities[i] = outputScores[0][i]
             }
         } else {
-            val outputBuffer = ByteBuffer.allocateDirect(outputTensor.numBytes())
-            outputBuffer.order(ByteOrder.nativeOrder())
+            val outBytes = outputTensor.numBytes()
+            val outputBuffer = reusableOutputBuffers.getOrPut(outBytes) {
+                ByteBuffer.allocateDirect(outBytes).apply {
+                    order(ByteOrder.nativeOrder())
+                }
+            }
+            outputBuffer.rewind()
             interpreterInstance.run(inputBuffer, outputBuffer)
             outputBuffer.rewind()
 
@@ -751,8 +1076,60 @@ class ContentModerationEngine(private val context: Context) {
     }
 
     /**
-     * Detects candidate face and figure bounding boxes in a downscaled `480p` frame and classifies
-     * each region using `model_lite_gender_q.tflite` (plus NSFW/revealing score).
+     * Evaluates the 5-class `QUANTIZED_NSFW` probabilities on [cropBitmap]
+     * to separate mandatory hardcore pornography/nudity (`explicitPornHentai`) from
+     * gender-gated revealing skin (`revealingSkin`).
+     */
+    @Synchronized
+    private fun evaluateNsfwAndSkinBreakdown(cropBitmap: Bitmap): Triple<Float, Float, Float> {
+        val skinRatio = estimateSkinPixelRatio(cropBitmap)
+        if (skinRatio < 0.045f) {
+            return Triple(0f, 0f, 0f)
+        }
+        val quantizedInterp = getOrLoadInterpreter(ModerationModelType.QUANTIZED_NSFW)
+        if (quantizedInterp != null) {
+            try {
+                val inTensor = quantizedInterp.getInputTensor(0)
+                val inShape = inTensor.shape()
+                val inSize = if (inShape.size >= 3 && inShape[1] > 0) inShape[1] else DEFAULT_INPUT_SIZE
+                val inQ = inTensor.quantizationParams()
+                val outTensor = quantizedInterp.getOutputTensor(0)
+                val outShape = outTensor.shape()
+                val numClasses = if (outShape.size >= 2 && outShape[1] > 0) outShape[1] else 5
+
+                val probs = runInferencePass(
+                    interpreterInstance = quantizedInterp,
+                    cropBitmap = cropBitmap,
+                    inputSize = inSize,
+                    inputDataType = inTensor.dataType(),
+                    inputScale = inQ.scale,
+                    inputZeroPoint = inQ.zeroPoint,
+                    outputTensor = outTensor,
+                    outputDataType = outTensor.dataType(),
+                    numClasses = numClasses,
+                    useMinusOneToOneRange = false
+                )
+                return computeFiveClassBreakdown(probs, skinRatio)
+            } catch (_: Throwable) {
+            }
+        }
+        return Triple(0f, 0f, 0f)
+    }
+
+    /**
+     * Detects candidate face, figure, and exposed-skin bounding boxes in a downscaled frame
+     * and classifies each region with strict gender isolation:
+     * - Localizes faces (`FaceDetector` + upper-head skin anchors) and classifies each face
+     *   on a square `128x128` crop using `model_lite_gender_q.tflite` (`FEMALE` vs `MALE`).
+     * - Links the body/exposed-skin region directly beneath each detected face to that person's
+     *   verified gender so:
+     *   - Selecting `Female` blurs female faces, female figures, and female exposed skin, while
+     *     NEVER blurring male faces, male figures, or male exposed skin.
+     *   - Selecting `Male` blurs male faces, male figures, and male exposed skin, while
+     *     NEVER blurring female faces, female figures, or female exposed skin.
+     *   - Mandatory hardcore pornography and explicit nudity are blurred for any gender.
+     * - Evaluates unanchored grid cells for exposed skin with tight skin-contour bounding boxes,
+     *   NEVER running `GENDER_FILTER` on face-free cells (`gender = UNKNOWN`).
      */
     @Synchronized
     fun detectRegionalBlurCandidates(
@@ -762,9 +1139,9 @@ class ContentModerationEngine(private val context: Context) {
         val h = frameBitmap.height
         if (w <= 16 || h <= 16) return emptyList()
 
-        val candidateRects = mutableListOf<android.graphics.RectF>()
+        val faceRects = mutableListOf<android.graphics.RectF>()
 
-        // 1. Hardware/Software Android FaceDetector pass on RGB_565 copy for fast face localization
+        // 1. Fast Android FaceDetector pass on RGB_565 copy for accurate face localization
         var rgb565: Bitmap? = null
         try {
             rgb565 = frameBitmap.copy(Bitmap.Config.RGB_565, false)
@@ -776,9 +1153,9 @@ class ContentModerationEngine(private val context: Context) {
                 val midPoint = android.graphics.PointF()
                 for (i in 0 until found) {
                     val face = faces[i] ?: continue
-                    if (face.confidence() >= 0.30f) {
+                    if (face.confidence() >= 0.28f) {
                         face.getMidPoint(midPoint)
-                        val eyeDist = face.eyesDistance().coerceAtLeast(16f)
+                        val eyeDist = face.eyesDistance().coerceAtLeast(14f)
                         val halfW = eyeDist * 1.45f
                         val halfH = eyeDist * 1.85f
                         val left = ((midPoint.x - halfW) / w.toFloat()).coerceIn(0f, 1f)
@@ -786,7 +1163,7 @@ class ContentModerationEngine(private val context: Context) {
                         val right = ((midPoint.x + halfW) / w.toFloat()).coerceIn(0f, 1f)
                         val bottom = ((midPoint.y + halfH) / h.toFloat()).coerceIn(0f, 1f)
                         if (right - left > 0.04f && bottom - top > 0.04f) {
-                            candidateRects.add(android.graphics.RectF(left, top, right, bottom))
+                            faceRects.add(android.graphics.RectF(left, top, right, bottom))
                         }
                     }
                 }
@@ -799,58 +1176,205 @@ class ContentModerationEngine(private val context: Context) {
             }
         }
 
-        // 2. If no explicit face landmarks were returned, evaluate the 3 active content bands
-        //    (Upper-Middle, Center, Lower-Middle) so figures/portraits are still caught
-        if (candidateRects.isEmpty()) {
-            candidateRects.add(android.graphics.RectF(0.12f, 0.14f, 0.88f, 0.52f))
-            candidateRects.add(android.graphics.RectF(0.12f, 0.32f, 0.88f, 0.70f))
-            candidateRects.add(android.graphics.RectF(0.12f, 0.50f, 0.88f, 0.88f))
-        }
-
         val results = mutableListOf<CandidateBlurBox>()
-        for (normRect in candidateRects) {
-            val cropLeft = (normRect.left * w).toInt().coerceIn(0, w - 2)
-            val cropTop = (normRect.top * h).toInt().coerceIn(0, h - 2)
-            val cropWidth = ((normRect.right - normRect.left) * w).toInt().coerceIn(1, w - cropLeft)
-            val cropHeight = ((normRect.bottom - normRect.top) * h).toInt().coerceIn(1, h - cropTop)
-            var subCrop: Bitmap? = null
-            try {
-                subCrop = Bitmap.createBitmap(frameBitmap, cropLeft, cropTop, cropWidth, cropHeight)
-                results.add(classifyCropForHaramBlur(subCrop, normRect))
-            } catch (_: Throwable) {
-            } finally {
-                try {
-                    if (subCrop != null && subCrop !== frameBitmap && !subCrop.isRecycled) {
-                        subCrop.recycle()
+
+        if (faceRects.isNotEmpty()) {
+            // Evaluate each localized face AND its linked body/skin region directly below the face
+            for (faceRect in faceRects) {
+                val faceCandidate = cropAndClassifyRegion(
+                    frameBitmap = frameBitmap,
+                    normRect = faceRect,
+                    isFaceAnchor = true,
+                    inheritedGender = null,
+                    inheritedGenderConf = 0f,
+                    isGridCell = false
+                )
+                if (faceCandidate != null) {
+                    results.add(faceCandidate)
+
+                    // Check the subject-linked torso / exposed-skin region below this face
+                    val faceW = faceRect.width()
+                    val faceH = faceRect.height()
+                    val bodyTop = (faceRect.bottom - faceH * 0.10f).coerceIn(0f, 0.90f)
+                    val bodyBottom = (faceRect.bottom + faceH * 2.15f).coerceIn(bodyTop + 0.06f, 0.96f)
+                    val bodyLeft = (faceRect.left - faceW * 0.40f).coerceIn(0f, 0.92f)
+                    val bodyRight = (faceRect.right + faceW * 0.40f).coerceIn(bodyLeft + 0.06f, 1f)
+
+                    if (bodyBottom - bodyTop >= 0.08f && bodyRight - bodyLeft >= 0.08f) {
+                        val bodyRect = android.graphics.RectF(bodyLeft, bodyTop, bodyRight, bodyBottom)
+                        val bodyCandidate = cropAndClassifyRegion(
+                            frameBitmap = frameBitmap,
+                            normRect = bodyRect,
+                            isFaceAnchor = false,
+                            inheritedGender = faceCandidate.gender,
+                            inheritedGenderConf = faceCandidate.genderConfidence,
+                            isGridCell = false
+                        )
+                        if (bodyCandidate != null) {
+                            results.add(bodyCandidate)
+                        }
                     }
-                } catch (_: Throwable) {
                 }
             }
         }
-        return results
+
+        // Active content grid cells to detect unanchored exposed skin, body parts, or swimwear/lingerie
+        val gridCells = listOf(
+            android.graphics.RectF(0.06f, 0.10f, 0.50f, 0.38f),
+            android.graphics.RectF(0.50f, 0.10f, 0.94f, 0.38f),
+            android.graphics.RectF(0.06f, 0.36f, 0.50f, 0.64f),
+            android.graphics.RectF(0.50f, 0.36f, 0.94f, 0.64f),
+            android.graphics.RectF(0.06f, 0.62f, 0.50f, 0.90f),
+            android.graphics.RectF(0.50f, 0.62f, 0.94f, 0.90f)
+        )
+        for (cellRect in gridCells) {
+            val overlapsFace = faceRects.any { computeCandidateIou(it, cellRect) >= 0.35f }
+            if (overlapsFace) continue
+
+            val cellCandidate = cropAndClassifyRegion(
+                frameBitmap = frameBitmap,
+                normRect = cellRect,
+                isFaceAnchor = false,
+                inheritedGender = null,
+                inheritedGenderConf = 0f,
+                isGridCell = true
+            )
+            if (cellCandidate != null) {
+                results.add(cellCandidate)
+            }
+        }
+
+        return mergeOverlappingCandidates(results)
+    }
+
+    private fun cropAndClassifyRegion(
+        frameBitmap: Bitmap,
+        normRect: android.graphics.RectF,
+        isFaceAnchor: Boolean,
+        inheritedGender: DetectedGender?,
+        inheritedGenderConf: Float,
+        isGridCell: Boolean = false
+    ): CandidateBlurBox? {
+        val w = frameBitmap.width
+        val h = frameBitmap.height
+        val cropLeft = (normRect.left * w).toInt().coerceIn(0, w - 2)
+        val cropTop = (normRect.top * h).toInt().coerceIn(0, h - 2)
+        val cropWidth = ((normRect.right - normRect.left) * w).toInt().coerceIn(1, w - cropLeft)
+        val cropHeight = ((normRect.bottom - normRect.top) * h).toInt().coerceIn(1, h - cropTop)
+
+        var subCrop: Bitmap? = null
+        return try {
+            subCrop = Bitmap.createBitmap(frameBitmap, cropLeft, cropTop, cropWidth, cropHeight)
+            val skinRatio = estimateSkinPixelRatio(subCrop)
+
+            if (!isFaceAnchor) {
+                // Body region or unanchored grid cell:
+                // NEVER run GENDER_FILTER on unanchored grid cells!
+                if (skinRatio < 0.045f) {
+                    return null
+                }
+                val (explicitPorn, revealingSkin, _) = evaluateNsfwAndSkinBreakdown(subCrop)
+                val boostedSkin = if (skinRatio >= 0.22f) {
+                    maxOf(revealingSkin, (skinRatio * 1.15f).coerceIn(0f, 0.88f))
+                } else {
+                    revealingSkin
+                }
+
+                if (boostedSkin < 0.20f && explicitPorn < 0.35f) {
+                    return null
+                }
+
+                // Compute tight skin-contour bounding box padded by +8% of the cell dimension
+                val tightRect = computeTightSkinBoundingBox(subCrop, normRect, 0.08f)
+                val effectiveGender = inheritedGender ?: DetectedGender.UNKNOWN
+                val effectiveGenderConf = if (effectiveGender != DetectedGender.UNKNOWN && boostedSkin >= 0.30f) {
+                    inheritedGenderConf
+                } else {
+                    0f
+                }
+
+                CandidateBlurBox(
+                    normalizedRect = tightRect,
+                    gender = effectiveGender,
+                    genderConfidence = effectiveGenderConf,
+                    nsfwConfidence = explicitPorn,
+                    explicitPornNudityConfidence = explicitPorn,
+                    revealingSkinConfidence = boostedSkin,
+                    isGridCell = isGridCell
+                )
+            } else {
+                classifyCropForHaramBlur(subCrop, normRect)
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try {
+                if (subCrop != null && subCrop !== frameBitmap && !subCrop.isRecycled) {
+                    subCrop.recycle()
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     /**
      * Classifies a single face/figure crop using `model_lite_gender_q.tflite` (`GENDER_FILTER`)
-     * and returns a [CandidateBlurBox] with gender (`FEMALE` / `MALE`) and confidence.
+     * on an aspect-preserved head crop plus `QUANTIZED_NSFW` breakdown, returning a [CandidateBlurBox]
+     * with strictly isolated gender (`FEMALE` / `MALE` / `UNKNOWN`), `explicitPornNudityConfidence`,
+     * and `revealingSkinConfidence`.
      */
     @Synchronized
     fun classifyCropForHaramBlur(
         cropBitmap: Bitmap,
-        normalizedRect: android.graphics.RectF = android.graphics.RectF(0f, 0f, 1f, 1f)
+        normalizedRect: android.graphics.RectF = android.graphics.RectF(0f, 0f, 1f, 1f),
+        isGridCell: Boolean = false
     ): CandidateBlurBox {
+        // Fix 3: Never run GENDER_FILTER (model_lite_gender_q.tflite) on unanchored grid cells!
+        if (isGridCell) {
+            val skinRatio = estimateSkinPixelRatio(cropBitmap)
+            if (skinRatio < 0.045f) {
+                return CandidateBlurBox(
+                    normalizedRect = normalizedRect,
+                    gender = DetectedGender.UNKNOWN,
+                    genderConfidence = 0f,
+                    nsfwConfidence = 0f,
+                    explicitPornNudityConfidence = 0f,
+                    revealingSkinConfidence = 0f,
+                    isGridCell = true
+                )
+            }
+            val (explicitPorn, revealingSkin, _) = evaluateNsfwAndSkinBreakdown(cropBitmap)
+            val boostedSkin = if (skinRatio >= 0.22f) {
+                maxOf(revealingSkin, (skinRatio * 1.15f).coerceIn(0f, 0.88f))
+            } else {
+                revealingSkin
+            }
+            val tightRect = computeTightSkinBoundingBox(cropBitmap, normalizedRect, 0.08f)
+            return CandidateBlurBox(
+                normalizedRect = tightRect,
+                gender = DetectedGender.UNKNOWN,
+                genderConfidence = 0f,
+                nsfwConfidence = explicitPorn,
+                explicitPornNudityConfidence = explicitPorn,
+                revealingSkinConfidence = boostedSkin,
+                isGridCell = true
+            )
+        }
+
         val interp = getOrLoadInterpreter(ModerationModelType.GENDER_FILTER)
             ?: return CandidateBlurBox(
                 normalizedRect = normalizedRect,
                 gender = DetectedGender.UNKNOWN,
                 genderConfidence = 0f,
-                nsfwConfidence = 0f
+                nsfwConfidence = 0f,
+                explicitPornNudityConfidence = 0f,
+                revealingSkinConfidence = 0f
             )
 
         return try {
             val inTensor = interp.getInputTensor(0)
             val inShape = inTensor.shape()
-            val inputSize = if (inShape.size >= 3 && inShape[1] > 0) inShape[1] else DEFAULT_INPUT_SIZE
+            val inputSize = if (inShape.size >= 3 && inShape[1] > 0) inShape[1] else 128
             val inType = inTensor.dataType()
             val inQ = inTensor.quantizationParams()
             val outTensor = interp.getOutputTensor(0)
@@ -858,30 +1382,62 @@ class ContentModerationEngine(private val context: Context) {
             val outShape = outTensor.shape()
             val numClasses = if (outShape.size >= 2 && outShape[1] > 0) outShape[1] else 2
 
-            val probs = runInferencePass(
-                interpreterInstance = interp,
-                cropBitmap = cropBitmap,
-                inputSize = inputSize,
-                inputDataType = inType,
-                inputScale = inQ.scale,
-                inputZeroPoint = inQ.zeroPoint,
-                outputTensor = outTensor,
-                outputDataType = outType,
-                numClasses = numClasses,
-                useMinusOneToOneRange = false
-            )
+            // Extract upper-center square head sub-crop when given a tall/wide body crop
+            // so the 128x128 face gender model sees an unstretched head/face region
+            var headCrop: Bitmap = cropBitmap
+            val cw = cropBitmap.width
+            val ch = cropBitmap.height
+            if (cw >= 32 && ch >= 32 && (cw > (ch * 1.35f) || ch > (cw * 1.35f))) {
+                val side = minOf(cw, (ch * 0.65f).toInt().coerceAtLeast(16)).coerceIn(1, minOf(cw, ch))
+                val hx = ((cw - side) / 2).coerceIn(0, cw - side)
+                val hy = (ch * 0.05f).toInt().coerceIn(0, ch - side)
+                headCrop = Bitmap.createBitmap(cropBitmap, hx, hy, side, side)
+            }
 
-            // Standard 2-class gender model: index 0 = Male / Neutral, index 1 = Female (or vice versa)
+            val probs = try {
+                runInferencePass(
+                    interpreterInstance = interp,
+                    cropBitmap = headCrop,
+                    inputSize = inputSize,
+                    inputDataType = inType,
+                    inputScale = inQ.scale,
+                    inputZeroPoint = inQ.zeroPoint,
+                    outputTensor = outTensor,
+                    outputDataType = outType,
+                    numClasses = numClasses,
+                    useMinusOneToOneRange = false
+                )
+            } finally {
+                if (headCrop !== cropBitmap && !headCrop.isRecycled) {
+                    headCrop.recycle()
+                }
+            }
+
+            // 2-class gender model: index 0 = Male, index 1 = Female
             val femaleScore = if (probs.size >= 2) probs[1].coerceIn(0f, 1f) else probs.getOrElse(0) { 0f }
             val maleScore = if (probs.size >= 2) probs[0].coerceIn(0f, 1f) else (1f - femaleScore).coerceIn(0f, 1f)
-            val gender = if (femaleScore >= maleScore) DetectedGender.FEMALE else DetectedGender.MALE
-            val genderConf = maxOf(femaleScore, maleScore)
+            val winningScore = maxOf(femaleScore, maleScore)
+            val margin = kotlin.math.abs(femaleScore - maleScore)
+
+            val (explicitPorn, revealingSkin, _) = evaluateNsfwAndSkinBreakdown(cropBitmap)
+
+            // Stage 3.2: Only assign FEMALE or MALE when the winning gender probability has a clear margin
+            // (winningScore >= 0.58f && margin >= 0.16f) so ambiguous or flat regions are UNKNOWN.
+            val gender = when {
+                winningScore < 0.58f || margin < 0.16f -> DetectedGender.UNKNOWN
+                femaleScore > maleScore -> DetectedGender.FEMALE
+                else -> DetectedGender.MALE
+            }
+            val genderConf = if (gender == DetectedGender.UNKNOWN) 0f else winningScore
 
             CandidateBlurBox(
                 normalizedRect = normalizedRect,
                 gender = gender,
                 genderConfidence = genderConf,
-                nsfwConfidence = femaleScore
+                // Keep nsfwConfidence as explicitPorn so opposite-gender candidates never bypass gender filtering
+                nsfwConfidence = explicitPorn,
+                explicitPornNudityConfidence = explicitPorn,
+                revealingSkinConfidence = revealingSkin
             )
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to classify HaramBlur crop", t)
@@ -889,9 +1445,30 @@ class ContentModerationEngine(private val context: Context) {
                 normalizedRect = normalizedRect,
                 gender = DetectedGender.UNKNOWN,
                 genderConfidence = 0f,
-                nsfwConfidence = 0f
+                nsfwConfidence = 0f,
+                explicitPornNudityConfidence = 0f,
+                revealingSkinConfidence = 0f
             )
         }
+    }
+
+    /**
+     * Evaluates an In-App WebView media element (`<img>` or `<video>`) with strict gender isolation
+     * and mandatory pornography/nudity enforcement.
+     */
+    @Synchronized
+    fun evaluateMediaCropForProtection(
+        cropBitmap: Bitmap,
+        targetGender: HaramBlurTargetGender,
+        sensitivity: HaramBlurSensitivity
+    ): Pair<Boolean, CandidateBlurBox> {
+        val candidate = classifyCropForHaramBlur(cropBitmap)
+        val shouldBlur = HaramBlurFilterLogic.shouldBlurCandidate(
+            candidate = candidate,
+            targetGender = targetGender,
+            sensitivity = sensitivity
+        )
+        return Pair(shouldBlur, candidate)
     }
 
     @Synchronized
@@ -909,11 +1486,21 @@ class ContentModerationEngine(private val context: Context) {
                 } catch (_: Throwable) {
                 }
             }
+            for (bmp in reusableScaledBitmaps.values) {
+                try {
+                    if (!bmp.isRecycled) bmp.recycle()
+                } catch (_: Throwable) {
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing LiteRT resources.", e)
         } finally {
             interpreters.clear()
             gpuDelegates.clear()
+            reusableScaledBitmaps.clear()
+            reusableInputBuffers.clear()
+            reusableOutputBuffers.clear()
+            reusablePixelArrays.clear()
         }
     }
 }

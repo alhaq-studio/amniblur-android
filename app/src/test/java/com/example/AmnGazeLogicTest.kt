@@ -2,6 +2,7 @@ package com.amngaze
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Build
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.flow.first
@@ -154,29 +155,29 @@ class AmnGazeLogicTest {
         assertFalse(scanner.containsBlockedTerm("Hide NSFW content toggle in settings", isUrlBarNode = false))
         assertFalse(scanner.containsBlockedTerm("Order #XXX-12345 shipped. Check av.net status in app.", isUrlBarNode = false))
         assertFalse(scanner.containsBlockedTerm("https://developer.android.com/reference/android/accessibilityservice/AccessibilityService", isUrlBarNode = true))
-        assertEquals(0.50f, ContentModerationEngine.confidenceThresholdForSensitivity(0.5f), 0.001f)
+        assertEquals(0.60f, ContentModerationEngine.confidenceThresholdForSensitivity(0.5f), 0.001f)
     }
 
     @Test
     fun testFiveClassNsfwScoringAndSafeUiGuard() {
         // [0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy
 
-        // 1. Plain text UI / settings screen where neutral + drawings > 0.78f -> SAFE (0.0f)
-        val safeUiProbs = floatArrayOf(0.15f, 0.02f, 0.70f, 0.05f, 0.08f) // neutral + drawings = 0.85f > 0.78f
+        // 1. Plain text UI / settings screen where neutral + drawings >= 0.50f -> SAFE (0.0f)
+        val safeUiProbs = floatArrayOf(0.15f, 0.02f, 0.70f, 0.05f, 0.08f) // neutral + drawings = 0.85f >= 0.50f
         assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(safeUiProbs, includeSexyScore = true), 0.001f)
 
-        // 2. Real-world nudity / revealing frame splitting probability between porn (0.30) and sexy (0.50)
-        //    explicitScore = 0.30 + 0.05 = 0.35
-        //    combinedNsfwScore = 0.30 + 0.05 + (0.50 * 0.85) = 0.775
+        // 2. Real-world nudity / revealing frame: porn (0.30) and sexy (0.50), hentai (0.05 < 0.65 excluded)
+        //    explicitScore = 0.30
+        //    combinedNsfwScore = 0.30 + (0.50 * 0.85) = 0.725
         val splitNsfwProbs = floatArrayOf(0.03f, 0.05f, 0.12f, 0.30f, 0.50f)
         assertEquals(
-            0.775f,
+            0.725f,
             ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = true),
             0.001f
         )
-        // When user disables revealing/sexy class, only porn + hentai (0.35) is counted
+        // When user disables revealing/sexy class, only explicit porn (0.30) is counted
         assertEquals(
-            0.35f,
+            0.30f,
             ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = false),
             0.001f
         )
@@ -184,11 +185,12 @@ class AmnGazeLogicTest {
 
     @Test
     fun testSensitivitySliderThresholdMapping() {
-        // 25% -> 0.62f, 50% -> 0.50f, 75% -> 0.38f, 95% -> 0.28f
-        assertEquals(0.62f, ContentModerationEngine.confidenceThresholdForSensitivity(0.25f), 0.005f)
-        assertEquals(0.50f, ContentModerationEngine.confidenceThresholdForSensitivity(0.50f), 0.005f)
-        assertEquals(0.38f, ContentModerationEngine.confidenceThresholdForSensitivity(0.75f), 0.005f)
-        assertEquals(0.28f, ContentModerationEngine.confidenceThresholdForSensitivity(0.95f), 0.005f)
+        // Fix 2: Calibrated thresholds: 20% -> 0.78f, 25% -> 0.74f, 50% -> 0.60f, 75% -> 0.48f, 95% -> 0.38f
+        assertEquals(0.78f, ContentModerationEngine.confidenceThresholdForSensitivity(0.20f), 0.005f)
+        assertEquals(0.74f, ContentModerationEngine.confidenceThresholdForSensitivity(0.25f), 0.005f)
+        assertEquals(0.60f, ContentModerationEngine.confidenceThresholdForSensitivity(0.50f), 0.005f)
+        assertEquals(0.48f, ContentModerationEngine.confidenceThresholdForSensitivity(0.75f), 0.005f)
+        assertEquals(0.38f, ContentModerationEngine.confidenceThresholdForSensitivity(0.95f), 0.005f)
     }
 
     @Test
@@ -371,9 +373,9 @@ class AmnGazeLogicTest {
         assertEquals(0.52f, HaramBlurSensitivity.MEDIUM.threshold, 0.001f)
         assertEquals(0.35f, HaramBlurSensitivity.HIGH.threshold, 0.001f)
 
-        // Effect strength 1..10 -> 8dp..36dp pixelation block size, 6px..42px blur radius
-        assertEquals(8f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.1f)
-        assertEquals(36f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.1f)
+        // Effect strength 1..10 -> 12dp..38dp pixelation block size, 6px..42px blur radius
+        assertEquals(12f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.1f)
+        assertEquals(38f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.1f)
         assertEquals(6f, HaramBlurFilterLogic.computeBlurRadiusPx(1), 0.1f)
         assertEquals(42f, HaramBlurFilterLogic.computeBlurRadiusPx(10), 0.1f)
 
@@ -471,7 +473,7 @@ class AmnGazeLogicTest {
         )
         assertTrue(frame3Regions.isEmpty())
 
-        // Also verify Accessibility TYPE_VIEW_SCROLLED immediately clears active regions
+        // Verify Stage 3.4: Accessibility TYPE_VIEW_SCROLLED with 0f delta RETAINS active regions (anti-wipeout)
         tracker.updateRegions(
             candidates = listOf(candidate),
             exteriorDiff = 0.20f,
@@ -482,6 +484,10 @@ class AmnGazeLogicTest {
         )
         assertEquals(1, tracker.getActiveRegions().size)
         tracker.onScrollDetected(0f)
+        assertEquals(1, tracker.getActiveRegions().size)
+
+        // Large page jump (>= 0.45f) clears regions
+        tracker.onScrollDetected(0.55f)
         assertTrue(tracker.getActiveRegions().isEmpty())
     }
 
@@ -622,6 +628,367 @@ class AmnGazeLogicTest {
                 usageSecondsMap = usageMap
             )
         )
+    }
+
+    @Test
+    fun testEffectStrengthSolidnessAndDensityCurveReachesOpaque255() = runBlocking {
+        // Fix 1: 100% solid opaque alpha (255) across all levels 1..10 so raw pixels never bleed through
+        for (lvl in 1..10) {
+            assertEquals("Strength $lvl must be 100% solid opaque (alpha=255)", 255, HaramBlurFilterLogic.computeOverlayAlpha(lvl))
+            assertEquals(100, HaramBlurFilterLogic.computeOverlaySolidnessPercent(lvl))
+        }
+
+        // Pixelation block size scales from 12dp at 1 up to 38dp at 10
+        assertEquals(12f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.01f)
+        assertEquals(38f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.01f)
+
+        // Verify all overlay styles have alpha 0xFF (255) across all strength levels
+        for (style in HaramBlurOverlayStyle.entries) {
+            for (lvl in listOf(1, 5, 10)) {
+                val color = HaramBlurFilterLogic.overlayColorArgb(style, lvl)
+                val alpha = (color ushr 24) and 0xFF
+                assertEquals("Style $style at level $lvl must have alpha 255", 255, alpha)
+            }
+        }
+
+        // Verify ViewModel synchronizes 1..10 strength and 1..20px in-app strength
+        viewModel.updateHaramBlurEffectStrength(10)
+        assertEquals(10, viewModel.state.first().haramBlurEffectStrength)
+        assertEquals(20, viewModel.state.first().inAppBlurStrengthPx)
+
+        viewModel.updateInAppBlurStrengthPx(6)
+        assertEquals(6, viewModel.state.first().inAppBlurStrengthPx)
+        assertEquals(3, viewModel.state.first().haramBlurEffectStrength)
+    }
+
+    @Test
+    fun testCalibratedSensitivityThresholdsAndSafeUiGating() {
+        // Fix 2: Calibrated sensitivity-to-threshold mapping
+        assertEquals(0.78f, ContentModerationEngine.confidenceThresholdForSensitivity(0.20f), 0.005f)
+        assertEquals(0.74f, ContentModerationEngine.confidenceThresholdForSensitivity(0.25f), 0.005f)
+        assertEquals(0.60f, ContentModerationEngine.confidenceThresholdForSensitivity(0.50f), 0.005f)
+        assertEquals(0.48f, ContentModerationEngine.confidenceThresholdForSensitivity(0.75f), 0.005f)
+        assertEquals(0.38f, ContentModerationEngine.confidenceThresholdForSensitivity(0.95f), 0.005f)
+
+        // Fix 2: Text/UI protection: skinRatio < 0.05f and pornProb < 0.82f returns 0.0f (SAFE)
+        val lowSkinTextScreen = floatArrayOf(0.10f, 0.05f, 0.40f, 0.35f, 0.10f)
+        assertEquals(
+            0.0f,
+            ContentModerationEngine.computeFiveClassNsfwScore(lowSkinTextScreen, includeSexyScore = true, skinRatio = 0.02f),
+            0.001f
+        )
+
+        // Fix 2: Safe UI guard: neutral + drawings >= 0.50f returns 0.0f (SAFE)
+        val uiChromeScreen = floatArrayOf(0.20f, 0.0f, 0.35f, 0.25f, 0.20f) // neutral(0.35) + drawings(0.20) = 0.55 >= 0.50
+        assertEquals(
+            0.0f,
+            ContentModerationEngine.computeFiveClassNsfwScore(uiChromeScreen, includeSexyScore = true, skinRatio = 0.15f),
+            0.001f
+        )
+
+        // Fix 2: Hentai requirement: only included when hentai >= 0.65f AND neutral < 0.20f AND skinRatio >= 0.08f
+        val weakHentai = floatArrayOf(0.10f, 0.55f, 0.15f, 0.0f, 0.0f) // hentai 0.55 < 0.65
+        assertEquals(
+            0.0f,
+            ContentModerationEngine.computeFiveClassNsfwScore(weakHentai, includeSexyScore = true, skinRatio = 0.20f),
+            0.001f
+        )
+        val strongHentai = floatArrayOf(0.05f, 0.72f, 0.10f, 0.0f, 0.0f) // hentai 0.72 >= 0.65, neutral 0.10 < 0.20
+        assertTrue(
+            ContentModerationEngine.computeFiveClassNsfwScore(strongHentai, includeSexyScore = true, skinRatio = 0.20f) >= 0.70f
+        )
+
+        // When includeSexyScore == false, sexy class is excluded
+        val sexyOnly = floatArrayOf(0.05f, 0.0f, 0.10f, 0.10f, 0.75f)
+        val scoreWithoutSexy = ContentModerationEngine.computeFiveClassNsfwScore(sexyOnly, includeSexyScore = false, skinRatio = 0.30f)
+        assertEquals(0.10f, scoreWithoutSexy, 0.001f)
+    }
+
+    @Test
+    fun testHaramBlurGridCellAndBodyDetectionWithoutFace() {
+        // Fix 3: Swimwear/lingerie body region without face anchor (gender == UNKNOWN)
+        val swimwearBody = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.3f, 0.8f, 0.8f),
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            nsfwConfidence = 0.10f,
+            explicitPornNudityConfidence = 0.10f,
+            revealingSkinConfidence = 0.55f,
+            isGridCell = true
+        )
+        // Body visual score = 0.10 + 0.55 = 0.65 >= 0.50 threshold -> blurred in FEMALE, MALE, and BOTH!
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = swimwearBody,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = swimwearBody,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = swimwearBody,
+                targetGender = HaramBlurTargetGender.BOTH,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+
+        // Fix 3: Safe background cell without skin (gender == UNKNOWN, revealingSkin = 0.05f, porn = 0f)
+        val safeBackgroundCell = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.05f, 0.10f, 0.50f, 0.40f),
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            nsfwConfidence = 0.0f,
+            explicitPornNudityConfidence = 0.0f,
+            revealingSkinConfidence = 0.05f,
+            isGridCell = true
+        )
+        assertFalse(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = safeBackgroundCell,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.HIGH
+            )
+        )
+
+        // Fix 3: Calling classifyCropForHaramBlur(cropBitmap, isGridCell = true) on a face-free background bitmap
+        // returns gender == DetectedGender.UNKNOWN and shouldBlurCandidate == false
+        val engineForGrid = ContentModerationEngine(context)
+        val faceFreeBackgroundBmp = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
+        faceFreeBackgroundBmp.eraseColor(android.graphics.Color.rgb(30, 50, 90))
+        try {
+            val gridCandidate = engineForGrid.classifyCropForHaramBlur(
+                cropBitmap = faceFreeBackgroundBmp,
+                isGridCell = true
+            )
+            assertEquals(DetectedGender.UNKNOWN, gridCandidate.gender)
+            assertTrue(gridCandidate.isGridCell)
+            assertFalse(
+                HaramBlurFilterLogic.shouldBlurCandidate(
+                    candidate = gridCandidate,
+                    targetGender = HaramBlurTargetGender.FEMALE,
+                    sensitivity = HaramBlurSensitivity.HIGH
+                )
+            )
+        } finally {
+            faceFreeBackgroundBmp.recycle()
+            engineForGrid.close()
+        }
+
+        // Fix 3: Candidate merging for overlapping body regions
+        val boxA = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.20f, 0.20f, 0.60f, 0.60f),
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            revealingSkinConfidence = 0.60f
+        )
+        val boxB = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.30f, 0.40f, 0.70f, 0.80f),
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            revealingSkinConfidence = 0.70f
+        )
+        val merged = ContentModerationEngine.mergeOverlappingCandidates(listOf(boxA, boxB))
+        assertEquals(1, merged.size)
+        assertEquals(0.20f, merged[0].normalizedRect.left, 0.01f)
+        assertEquals(0.20f, merged[0].normalizedRect.top, 0.01f)
+        assertEquals(0.70f, merged[0].normalizedRect.right, 0.01f)
+        assertEquals(0.80f, merged[0].normalizedRect.bottom, 0.01f)
+    }
+
+    @Test
+    fun testStrictGenderIsolationPreventsOppositeGenderSkinBlurring() {
+        // Shirtless / exposed-skin MALE subject (revealingSkinConfidence = 0.80f, explicitPornNudityConfidence = 0.10f)
+        val maleWithExposedSkin = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.2f, 0.7f, 0.8f),
+            gender = DetectedGender.MALE,
+            genderConfidence = 0.84f,
+            nsfwConfidence = 0.10f,
+            explicitPornNudityConfidence = 0.10f,
+            revealingSkinConfidence = 0.80f
+        )
+
+        // When targetGender = FEMALE, a MALE face/figure/exposed-skin MUST NOT be blurred
+        assertFalse(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.HIGH
+            )
+        )
+        // When targetGender = MALE or BOTH, the MALE subject IS blurred
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = maleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.BOTH,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+
+        // Exposed-skin FEMALE subject (revealingSkinConfidence = 0.76f, explicitPornNudityConfidence = 0.08f)
+        val femaleWithExposedSkin = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.2f, 0.2f, 0.7f, 0.8f),
+            gender = DetectedGender.FEMALE,
+            genderConfidence = 0.45f,
+            nsfwConfidence = 0.08f,
+            explicitPornNudityConfidence = 0.08f,
+            revealingSkinConfidence = 0.76f
+        )
+
+        // When targetGender = FEMALE, female exposed skin IS blurred even if face confidence alone was 0.45f
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = femaleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        // When targetGender = MALE, female non-pornographic skin MUST NOT be blurred
+        assertFalse(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = femaleWithExposedSkin,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.HIGH
+            )
+        )
+
+        // Mandatory hardcore pornography / explicit nudity is ALWAYS blurred regardless of targetGender
+        val explicitPornMale = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.1f, 0.1f, 0.9f, 0.9f),
+            gender = DetectedGender.MALE,
+            genderConfidence = 0.80f,
+            nsfwConfidence = 0.88f,
+            explicitPornNudityConfidence = 0.88f,
+            revealingSkinConfidence = 0.90f
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = explicitPornMale,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.LOW
+            )
+        )
+        assertTrue(
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = explicitPornMale,
+                targetGender = HaramBlurTargetGender.MALE,
+                sensitivity = HaramBlurSensitivity.LOW
+            )
+        )
+    }
+
+    @Test
+    fun testPreBlurNewMediaSettingPersistenceAndWebViewScript() = runBlocking {
+        assertFalse(viewModel.state.first().preBlurNewMediaUntilScanned)
+        viewModel.setPreBlurNewMediaUntilScanned(true)
+        assertTrue(viewModel.state.first().preBlurNewMediaUntilScanned)
+
+        val reloaded = AmnGazeViewModel(context as Application).state.first()
+        assertTrue(reloaded.preBlurNewMediaUntilScanned)
+
+        val scriptWithPreBlur = WebViewModerationBridge.generateDomObserverJavascript(
+            whatToProtect = setOf(WhatToProtectItem.IMAGES, WhatToProtectItem.VIDEOS),
+            blurStyle = HaramBlurOverlayStyle.BLUR,
+            strengthPx = 20,
+            feedControlConfig = FeedControlConfig(),
+            preBlurNewMediaUntilScanned = true
+        )
+        assertTrue(scriptWithPreBlur.contains("window.__amngazePreBlurEnabled = true"))
+        assertTrue(scriptWithPreBlur.contains("PREBLUR"))
+    }
+
+    @Test
+    fun testAutomaticModelRoutingAndChildSafe30sKeywordOnlySnooze() {
+        // 1. Stage 1 & Fix 2: Automatic Model Routing — Adult Content Blocker exclusively uses QUANTIZED_NSFW
+        assertEquals(
+            ModerationModelType.QUANTIZED_NSFW,
+            ContentModerationEngine.resolveAdultBlockerModel(ModerationModelType.GENDER_FILTER)
+        )
+        assertEquals(
+            ModerationModelType.QUANTIZED_NSFW,
+            ContentModerationEngine.resolveAdultBlockerModel(ModerationModelType.QUANTIZED_NSFW)
+        )
+        assertEquals(
+            ModerationModelType.QUANTIZED_NSFW,
+            ContentModerationEngine.resolveAdultBlockerModel(ModerationModelType.DEFAULT_NSFW)
+        )
+
+        val engine = ContentModerationEngine(context)
+        val bmp = Bitmap.createBitmap(224, 224, Bitmap.Config.ARGB_8888)
+        try {
+            val verdict = engine.classifyBitmap(
+                bitmap = bmp,
+                sensitivity = 0.5f,
+                modelType = ModerationModelType.GENDER_FILTER
+            )
+            // Even if GENDER_FILTER was passed in from legacy prefs, it is routed to QUANTIZED_NSFW
+            assertNotEquals(ModerationModelType.GENDER_FILTER, verdict.modelType)
+            assertEquals(ModerationModelType.QUANTIZED_NSFW, verdict.modelType)
+        } finally {
+            bmp.recycle()
+            engine.close()
+        }
+
+        // 2. Stage 2: Child-Safe 30s Keyword-Only Snooze
+        assertTrue(StrikeLockoutManager.canSnoozeViolationFor30Seconds(ViolationTriggerSource.TEXT_KEYWORD_MATCH))
+        assertFalse(StrikeLockoutManager.canSnoozeViolationFor30Seconds(ViolationTriggerSource.ADULT_DOMAIN_URL))
+        assertFalse(StrikeLockoutManager.canSnoozeViolationFor30Seconds(ViolationTriggerSource.VISUAL_NSFW_IMAGE_OR_VIDEO))
+
+        val lockoutMgr = StrikeLockoutManager()
+        val scanner = FastPathUrlAndKeywordScanner()
+        scanner.updateBlockedDomains(setOf("pornhub.com", "xvideos.com"))
+
+        // Before snooze: standalone keyword triggers TEXT_KEYWORD_MATCH
+        val keywordViolationBefore = scanner.findViolation(
+            rawInput = "Watch free porno videos",
+            isUrlBarNode = false,
+            isKeywordSnoozed = lockoutMgr.isKeywordTextSnoozed("com.android.chrome", 10_000L)
+        )
+        assertNotNull(keywordViolationBefore)
+        assertEquals(ViolationTriggerSource.TEXT_KEYWORD_MATCH, keywordViolationBefore!!.triggerSource)
+
+        // Snooze keyword text for 30s on Chrome (expires at 40_000L)
+        lockoutMgr.snoozeKeywordTextOnly("com.android.chrome", 10_000L, 30_000L)
+        assertTrue(lockoutMgr.isKeywordTextSnoozed("com.android.chrome", 25_000L))
+
+        // During 30s keyword snooze (at 25_000L): standalone text keyword is suppressed...
+        val keywordViolationDuringSnooze = scanner.findViolation(
+            rawInput = "Watch free porno videos",
+            isUrlBarNode = false,
+            isKeywordSnoozed = lockoutMgr.isKeywordTextSnoozed("com.android.chrome", 25_000L)
+        )
+        assertNull(keywordViolationDuringSnooze)
+
+        // ...BUT explicit adult domain URLs (e.g., pornhub.com) are STILL IMMEDIATELY BLOCKED!
+        val adultUrlDuringSnooze = scanner.findViolation(
+            rawInput = "https://www.pornhub.com/view_video.php?viewkey=123",
+            isUrlBarNode = true,
+            isKeywordSnoozed = lockoutMgr.isKeywordTextSnoozed("com.android.chrome", 25_000L)
+        )
+        assertNotNull("Adult domain URLs must NEVER be bypassed during a 30s keyword snooze", adultUrlDuringSnooze)
+        assertEquals(ViolationTriggerSource.ADULT_DOMAIN_URL, adultUrlDuringSnooze!!.triggerSource)
+
+        // After 30s expiry (at 41_000L): keyword snooze expires and keywords trigger again
+        assertFalse(lockoutMgr.isKeywordTextSnoozed("com.android.chrome", 41_000L))
+        val keywordAfterExpiry = scanner.findViolation(
+            rawInput = "Watch free porno videos",
+            isUrlBarNode = false,
+            isKeywordSnoozed = lockoutMgr.isKeywordTextSnoozed("com.android.chrome", 41_000L)
+        )
+        assertNotNull(keywordAfterExpiry)
     }
 }
 

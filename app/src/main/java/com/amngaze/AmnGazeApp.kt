@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.*
@@ -39,7 +40,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -712,7 +713,7 @@ fun QuickSetupScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.HelpOutline,
+                            imageVector = Icons.AutoMirrored.Filled.HelpOutline,
                             contentDescription = "Restricted Settings Help",
                             tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(22.dp)
@@ -958,7 +959,7 @@ fun MainDashboardScreen(
                     }
                     IconButton(onClick = onOpenRestrictedSettingsHelp) {
                         Icon(
-                            imageVector = Icons.Default.HelpOutline,
+                            imageVector = Icons.AutoMirrored.Filled.HelpOutline,
                             contentDescription = "Restricted Settings Guide",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1264,7 +1265,7 @@ fun MainDashboardScreen(
                             Text(
                                 text = when (state.enforcementMode) {
                                     EnforcementMode.CURTAIN_SHIELD ->
-                                        "Covers entire screen (#F20F172A + Blur) with Leave Safely & 30s Unblur actions"
+                                        "Covers entire screen (#F20F172A + Blur) with Leave Safely & 30s Keyword Alert Snooze"
                                     EnforcementMode.HARD_EJECT ->
                                         "Strikes 1-2: Auto-Back | Strike 3 (within 5m): 15-Minute App Cooldown Lockout"
                                 },
@@ -1321,7 +1322,7 @@ fun MainDashboardScreen(
                             val (title, description, icon) = when (mode) {
                                 EnforcementMode.CURTAIN_SHIELD -> Triple(
                                     "Curtain Shield Mode (Recommended)",
-                                    "Instant <2ms full-screen shield with 'Leave Safely' and 'False Positive - Unblur for 30s'. Eliminates self-occlusion flicker.",
+                                    "Instant <2ms full-screen shield with 'Leave Page Safely' and child-safe 'Skip Keyword Alert for 30s' (visual AI & adult domain blocking remain 100% active).",
                                     Icons.Default.VisibilityOff
                                 )
                                 EnforcementMode.HARD_EJECT -> Triple(
@@ -1607,102 +1608,7 @@ fun MainDashboardScreen(
                 }
             }
 
-            // 7. On-Device LiteRT Moderation Model Selector
-            item {
-                Text(
-                    "ON-DEVICE LITERT MODEL",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    letterSpacing = 0.08.sp
-                )
-            }
-
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                    )
-                ) {
-                    Column {
-                        ModerationModelType.entries.forEachIndexed { index, modelType ->
-                            val (title, description, icon) = when (modelType) {
-                                ModerationModelType.DEFAULT_NSFW -> Triple(
-                                    "Default NSFW Filter",
-                                    "Standard MobileNet V2 NSFW model (amn_gaze.tflite)",
-                                    Icons.Default.Security
-                                )
-                                ModerationModelType.QUANTIZED_NSFW -> Triple(
-                                    "Quantized NSFW Filter",
-                                    "Fast INT8/UINT8 quantized model (nsfw_mobilenet_v2_140_224_quantized.tflite)",
-                                    Icons.Default.Speed
-                                )
-                                ModerationModelType.GENDER_FILTER -> Triple(
-                                    "Gender / Revealing Filter",
-                                    "Compact gender classification model (model_lite_gender_q.tflite)",
-                                    Icons.Default.Face
-                                )
-                            }
-
-                            val isSelected = state.amnGazeModelType == modelType
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { viewModel.updateModelType(modelType) }
-                                    .background(
-                                        if (isSelected)
-                                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
-                                        else Color.Transparent
-                                    )
-                                    .padding(horizontal = 16.dp, vertical = 14.dp)
-                                    .testTag("model_type_${modelType.name}"),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                RadioButton(
-                                    selected = isSelected,
-                                    onClick = { viewModel.updateModelType(modelType) },
-                                    colors = RadioButtonDefaults.colors(
-                                        selectedColor = MaterialTheme.colorScheme.primary
-                                    )
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Icon(
-                                    imageVector = icon,
-                                    contentDescription = null,
-                                    tint = if (isSelected) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(Modifier.width(12.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        title,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isSelected) MaterialTheme.colorScheme.primary
-                                        else MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Text(
-                                        description,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                            if (index < ModerationModelType.entries.size - 1) {
-                                HorizontalDivider(
-                                    modifier = Modifier.padding(horizontal = 16.dp),
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 8. Strike & Lockout Status Card
+            // 7. Strike & Lockout Status Card
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1773,15 +1679,10 @@ fun MainDashboardScreen(
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(Modifier.width(10.dp))
-                        val modelLabel = when (state.amnGazeModelType) {
-                            ModerationModelType.DEFAULT_NSFW -> "Default NSFW (amn_gaze.tflite)"
-                            ModerationModelType.QUANTIZED_NSFW -> "Quantized NSFW (nsfw_mobilenet_v2_140_224_quantized.tflite)"
-                            ModerationModelType.GENDER_FILTER -> "Gender Filter (model_lite_gender_q.tflite)"
-                        }
                         Text(
                             "AmnGaze runs 100% locally in RAM with zero cloud uploads. " +
                                 "Scroll-settled screenshots (180ms settle / 750ms ceiling), MediaProjection regional frames, and HardwareBuffers are recycled immediately after inference. " +
-                                "Active Model: $modelLabel.",
+                                "Active Engine: Automatic Dual-Model Pipeline (Quantized NSFW + Default NSFW for Adult Blocker; Lite Gender + NSFW for Regional Blur).",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

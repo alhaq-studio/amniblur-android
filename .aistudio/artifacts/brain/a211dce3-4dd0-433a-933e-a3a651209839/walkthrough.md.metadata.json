@@ -1,5 +1,5 @@
 {
-  "summary":  "Appended Section 7 documenting the 6 on-device image, lazy-loaded frame, and video NSFW detection fixes (dynamic tensor inspection, 5-class sexy + safe UI scoring, 3-crop aspect-ratio extraction, calibrated sensitivity thresholds, two-stage 180ms+900ms scroll scanning + 1500ms video heartbeat, and dynamic PackageManager browser discovery).",
-  "updatedAt":  "2026-10-28T00:31:46.667057424Z",
+  "summary":  "Walkthrough of the 3-part real-device accuracy and rendering fix pass across RegionalBlurOverlayView, HaramBlurProjectionService, WebViewModerationBridge, ContentModerationEngine, HaramBlurEngineLogic, and AmnGazeLogicTest.",
+  "updatedAt":  "2026-10-29T22:29:06.949146654Z",
   "userFacing":  true
 }

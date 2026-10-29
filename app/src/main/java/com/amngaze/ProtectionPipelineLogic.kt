@@ -14,6 +14,17 @@ import java.util.concurrent.ConcurrentHashMap
  * 3. [ScrollSettleDebounceController]: Hybrid Leading + Trailing scroll debounce state machine
  *    (180ms settle delay + 750ms continuous-scroll ceiling) and version-aware AOSP rate-limit guard.
  */
+enum class ViolationTriggerSource {
+    ADULT_DOMAIN_URL,
+    VISUAL_NSFW_IMAGE_OR_VIDEO,
+    TEXT_KEYWORD_MATCH
+}
+
+data class FastPathViolation(
+    val reason: String,
+    val triggerSource: ViolationTriggerSource
+)
+
 data class StrikeDecision(
     val packageName: String,
     val strikeCountInWindow: Int,
@@ -33,12 +44,16 @@ class StrikeLockoutManager(
         const val DEFAULT_STRIKE_WINDOW_MS = 5 * 60_000L      // 5-minute rolling strike window
         const val DEFAULT_MAX_STRIKES = 3                     // 3 strikes trigger lockout
         const val DEFAULT_LOCKOUT_DURATION_MS = 15 * 60_000L  // 15-minute package cooldown
-        const val DEFAULT_WHITELIST_DURATION_MS = 30_000L     // 30-second false-positive unblur
+        const val DEFAULT_WHITELIST_DURATION_MS = 30_000L     // 30-second keyword-only false-positive snooze
+
+        fun canSnoozeViolationFor30Seconds(triggerSource: ViolationTriggerSource): Boolean {
+            return triggerSource == ViolationTriggerSource.TEXT_KEYWORD_MATCH
+        }
     }
 
     private val strikeTimestamps = ConcurrentHashMap<String, MutableList<Long>>()
     private val lockedPackages = ConcurrentHashMap<String, Long>()
-    private val whitelistedPackages = ConcurrentHashMap<String, Long>()
+    private val keywordSnoozedTargets = ConcurrentHashMap<String, Long>()
 
     init {
         loadPersistedLockouts()
@@ -73,7 +88,7 @@ class StrikeLockoutManager(
 
     @Synchronized
     fun recordViolation(packageName: String, nowMs: Long): StrikeDecision {
-        whitelistedPackages.remove(packageName)
+        keywordSnoozedTargets.remove(packageName)
 
         // Never record strikes or lockouts for launchers, system UI, or non-monitored packages
         if (packageName !in FastPathUrlAndKeywordScanner.HIGH_RISK_MEDIA_PACKAGES) {
@@ -125,23 +140,40 @@ class StrikeLockoutManager(
         }
     }
 
+    /**
+     * Snoozes ONLY standalone UI text keyword alerts (`TEXT_KEYWORD_MATCH`) for [packageNameOrHost]
+     * for [durationMs] (default 30s). Does NOT disable Visual AI scanning (`VISUAL_NSFW_IMAGE_OR_VIDEO`)
+     * or Adult URL domain blocking (`ADULT_DOMAIN_URL`).
+     */
+    @Synchronized
+    fun snoozeKeywordTextOnly(
+        packageNameOrHost: String,
+        nowMs: Long,
+        durationMs: Long = whitelistDurationMs
+    ) {
+        if (packageNameOrHost.isBlank()) return
+        keywordSnoozedTargets[packageNameOrHost] = nowMs + durationMs
+    }
+
+    @Synchronized
+    fun isKeywordTextSnoozed(packageNameOrHost: String, nowMs: Long): Boolean {
+        val expiry = keywordSnoozedTargets[packageNameOrHost] ?: return false
+        return if (nowMs < expiry) {
+            true
+        } else {
+            keywordSnoozedTargets.remove(packageNameOrHost)
+            false
+        }
+    }
+
     @Synchronized
     fun whitelistPackageTemporarily(packageName: String, nowMs: Long) {
-        lockedPackages.remove(packageName)
-        strikeTimestamps.remove(packageName)
-        whitelistedPackages[packageName] = nowMs + whitelistDurationMs
-        persistLockouts()
+        snoozeKeywordTextOnly(packageName, nowMs, whitelistDurationMs)
     }
 
     @Synchronized
     fun isPackageWhitelisted(packageName: String, nowMs: Long): Boolean {
-        val expiry = whitelistedPackages[packageName] ?: return false
-        return if (nowMs < expiry) {
-            true
-        } else {
-            whitelistedPackages.remove(packageName)
-            false
-        }
+        return isKeywordTextSnoozed(packageName, nowMs)
     }
 
     @Synchronized
@@ -179,7 +211,7 @@ class StrikeLockoutManager(
     fun clearAllLockouts() {
         lockedPackages.clear()
         strikeTimestamps.clear()
-        whitelistedPackages.clear()
+        keywordSnoozedTargets.clear()
         persistLockouts()
     }
 
@@ -487,23 +519,37 @@ class FastPathUrlAndKeywordScanner(
     }
 
     /**
-     * Inspects a browser URL bar string or visible UI text node and returns the matched rule
-     * description if explicit content is found, or null if safe.
+     * Inspects a browser URL bar string or visible UI text node and returns a structured
+     * [FastPathViolation] with its [ViolationTriggerSource], or null if safe.
+     *
+     * CRITICAL CHILD-SAFE RULE:
+     * When [isKeywordSnoozed] is true (during a 30-second false-positive keyword snooze),
+     * Step 1 (`EXPLICIT_DOMAIN_MARKERS`) and Step 2 (`blockedDomains` 80k adult domain set)
+     * STILL RUN unconditionally so explicit adult domains (e.g., pornhub.com) can NEVER be
+     * bypassed during a 30s snooze. Only Step 3 (`EXPLICIT_STANDALONE_TOKENS`) is skipped.
      */
-    fun findViolationReason(rawInput: String?, isUrlBarNode: Boolean = false): String? {
+    fun findViolation(
+        rawInput: String?,
+        isUrlBarNode: Boolean = false,
+        isKeywordSnoozed: Boolean = false
+    ): FastPathViolation? {
         if (rawInput.isNullOrBlank()) return null
         val normalized = rawInput.trim().lowercase()
         if (normalized.length < 4) return null
 
-        // 1. Check unambiguous explicit domain markers
+        // 1. Check unambiguous explicit domain markers (ALWAYS active, never snoozable)
         for (marker in EXPLICIT_DOMAIN_MARKERS) {
             if (normalized.contains(marker)) {
-                return "Blocked explicit domain ($marker)"
+                return FastPathViolation(
+                    reason = "Blocked explicit domain ($marker)",
+                    triggerSource = ViolationTriggerSource.ADULT_DOMAIN_URL
+                )
             }
         }
 
-        // 2. Only check the 80k domain HashSet when reading an actual Browser URL bar node
+        // 2. Check the 80k domain HashSet when reading an actual Browser URL bar node
         //    OR when the text explicitly starts with http://, https://, or www.
+        //    (ALWAYS active, never snoozable)
         val hasExplicitUrlPrefix = normalized.startsWith("http://") ||
             normalized.startsWith("https://") ||
             normalized.startsWith("www.")
@@ -511,23 +557,48 @@ class FastPathUrlAndKeywordScanner(
         if (isUrlBarNode || hasExplicitUrlPrefix) {
             val candidateHost = extractCandidateHost(normalized, allowBareHost = isUrlBarNode)
             if (candidateHost != null && isHostInBlockedSet(candidateHost)) {
-                return "Blocked adult domain ($candidateHost)"
+                return FastPathViolation(
+                    reason = "Blocked adult domain ($candidateHost)",
+                    triggerSource = ViolationTriggerSource.ADULT_DOMAIN_URL
+                )
             }
         }
 
         // 3. Word-boundary token scan against strict unambiguous adult tokens
-        val words = normalized.split(TOKEN_SPLIT_REGEX)
-        for (word in words) {
-            if (word.length >= 4 && word in EXPLICIT_STANDALONE_TOKENS) {
-                return "Blocked explicit keyword ($word)"
+        //    (Skipped ONLY when keyword text alerts are temporarily snoozed for 30s)
+        if (!isKeywordSnoozed) {
+            val words = normalized.split(TOKEN_SPLIT_REGEX)
+            for (word in words) {
+                if (word.length >= 4 && word in EXPLICIT_STANDALONE_TOKENS) {
+                    return FastPathViolation(
+                        reason = "Blocked explicit keyword ($word)",
+                        triggerSource = ViolationTriggerSource.TEXT_KEYWORD_MATCH
+                    )
+                }
             }
         }
 
         return null
     }
 
-    fun containsBlockedTerm(input: String?, isUrlBarNode: Boolean = false): Boolean {
-        return findViolationReason(input, isUrlBarNode) != null
+    /**
+     * Inspects a browser URL bar string or visible UI text node and returns the matched rule
+     * description if explicit content is found, or null if safe.
+     */
+    fun findViolationReason(
+        rawInput: String?,
+        isUrlBarNode: Boolean = false,
+        isKeywordSnoozed: Boolean = false
+    ): String? {
+        return findViolation(rawInput, isUrlBarNode, isKeywordSnoozed)?.reason
+    }
+
+    fun containsBlockedTerm(
+        input: String?,
+        isUrlBarNode: Boolean = false,
+        isKeywordSnoozed: Boolean = false
+    ): Boolean {
+        return findViolation(input, isUrlBarNode, isKeywordSnoozed) != null
     }
 
     private fun extractCandidateHost(input: String, allowBareHost: Boolean): String? {
