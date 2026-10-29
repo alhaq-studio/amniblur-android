@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.*
@@ -39,7 +40,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -712,7 +713,7 @@ fun QuickSetupScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.HelpOutline,
+                            imageVector = Icons.AutoMirrored.Filled.HelpOutline,
                             contentDescription = "Restricted Settings Help",
                             tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(22.dp)
@@ -958,7 +959,7 @@ fun MainDashboardScreen(
                     }
                     IconButton(onClick = onOpenRestrictedSettingsHelp) {
                         Icon(
-                            imageVector = Icons.Default.HelpOutline,
+                            imageVector = Icons.AutoMirrored.Filled.HelpOutline,
                             contentDescription = "Restricted Settings Guide",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1264,7 +1265,7 @@ fun MainDashboardScreen(
                             Text(
                                 text = when (state.enforcementMode) {
                                     EnforcementMode.CURTAIN_SHIELD ->
-                                        "Covers entire screen (#F20F172A + Blur) with Leave Safely & 30s Unblur actions"
+                                        "Covers entire screen (#F20F172A + Blur) with Leave Safely & 30s Keyword Alert Snooze"
                                     EnforcementMode.HARD_EJECT ->
                                         "Strikes 1-2: Auto-Back | Strike 3 (within 5m): 15-Minute App Cooldown Lockout"
                                 },
@@ -1321,7 +1322,7 @@ fun MainDashboardScreen(
                             val (title, description, icon) = when (mode) {
                                 EnforcementMode.CURTAIN_SHIELD -> Triple(
                                     "Curtain Shield Mode (Recommended)",
-                                    "Instant <2ms full-screen shield with 'Leave Safely' and 'False Positive - Unblur for 30s'. Eliminates self-occlusion flicker.",
+                                    "Instant <2ms full-screen shield with 'Leave Page Safely' and child-safe 'Skip Keyword Alert for 30s' (visual AI & adult domain blocking remain 100% active).",
                                     Icons.Default.VisibilityOff
                                 )
                                 EnforcementMode.HARD_EJECT -> Triple(
