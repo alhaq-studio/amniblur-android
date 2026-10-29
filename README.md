@@ -68,9 +68,10 @@ AmnGaze is an on-device Android content protection application powered by Androi
 - **3-Crop Aspect-Ratio Extraction (`ContentModerationEngine`)**:
   - Copies `HardwareBuffer` once to a proportional `360px`-wide software `ARGB_8888` bitmap before closing `HardwareBuffer` in `finally`.
   - Extracts 3 square `224x224` crops from the active content region (trimming top 10% status/URL bar and bottom 10% navigation bar): **Crop 1 (Center Square)** with immediate short-circuit, **Crop 2 (Upper-Middle 10%–55%)**, and **Crop 3 (Lower-Middle 45%–90%)**.
-- **Dynamic Tensor Inspection & 5-Class Scoring**:
-  - Inspects `inputTensor` and `outputTensor` dynamically (`FLOAT32` RGB `[0.0f..1.0f]` vs `UINT8` RGB `[0..255]` + `quantizationParams`).
-  - Combines `porn [3] + hentai [1] + (sexy [4] * 0.85f)` (configurable via dashboard toggle) with a `neutral [2] + drawings [0] > 0.78f` safe-UI guard and calibrated sensitivity thresholds (`25% -> 0.62`, `50% -> 0.50`, `75% -> 0.38`, `95% -> 0.28`).
+- **Dynamic Tensor Inspection, Skin Pre-Gate & 5-Class Scoring**:
+  - Routes Adult/Explicit Blocker scans exclusively to `ModerationModelType.QUANTIZED_NSFW` (`nsfw_mobilenet_v2_140_224_quantized.tflite`), eliminating Caffe BGR/RGB mismatch false positives from `amn_gaze.tflite`.
+  - Short-circuits crops with `skinRatio < 0.045f` before LiteRT inference so text-only pages, dark/light app UI, and settings screens never trigger false positives.
+  - Combines `porn [3] + hentai [1] + (sexy [4] * 0.85f)` (configurable via dashboard toggle) with a `skinRatio < 0.05f` media presence gate, a `neutral [2] + drawings [0] >= 0.50f` safe-UI guard, false `hentai` spike suppression (`hentai >= 0.65f && neutral < 0.20f && skinRatio >= 0.08f`), and calibrated sensitivity thresholds (`20% -> 0.78`, `25% -> 0.74`, `50% -> 0.60`, `75% -> 0.48`, `95% -> 0.38`).
 - **Browser-Scoped Incognito / `FLAG_SECURE` Enforcement**: Enforces `ERROR_TAKE_SCREENSHOT_SECURE_WINDOW` strictly when inside a browser package (`BROWSER_PACKAGES`), avoiding false blocks on `FLAG_SECURE` banking apps or password managers.
 
 ### Layer 3: `<2ms` App-Scoped Curtain Shield & Mode Separation (`BlurOverlayManager`)
@@ -84,9 +85,9 @@ AmnGaze is an on-device Android content protection application powered by Androi
 ---
 
 ## Bundled On-Device LiteRT Models (`app/src/main/assets/`)
-- `amn_gaze.tflite` — Default MobileNetV2 NSFW classifier (`[0.0f, 1.0f]` RGB normalized, dynamically inspected)
-- `nsfw_mobilenet_v2_140_224_quantized.tflite` — Fast MobileNetV2 NSFW classifier (5-class `[drawings, hentai, neutral, porn, sexy]`)
-- `model_lite_gender_q.tflite` — Compact gender / revealing content classifier (`[0.0f, 1.0f]` RGB normalized)
+- `nsfw_mobilenet_v2_140_224_quantized.tflite` — Primary 5-class MobileNetV2 NSFW classifier (`[drawings, hentai, neutral, porn, sexy]`) used exclusively for Adult Blocker & HaramBlur body/grid scoring
+- `model_lite_gender_q.tflite` — Compact `128x128` 2-class face gender classifier used strictly on localized `FaceDetector` anchors (`isFaceAnchor == true`)
+- `amn_gaze.tflite` — Legacy Caffe BGR (`B - 104, G - 117, R - 123`) NSFW classifier (preprocessed with VGG BGR mean subtraction if invoked directly)
 - `nsfw.txt` — 79,961 adult domains loaded asynchronously into an in-memory O(1) `HashSet` (filtered to `>=7` chars and checked only on URL nodes)
 
 ---
@@ -96,19 +97,16 @@ AmnGaze is an on-device Android content protection application powered by Androi
 - [x] **v2.0**: Replaced legacy `MediaProjection` regional bounding-box pipeline with `AmnGazeAccessibilityService` 3-Layer Curtain Shield & 3-Strike Lockout.
 - [x] **v2.1**: False-positive calibration (removed ambiguous keywords, restricted `nsfw.txt` to URL nodes `>=7` chars).
 - [x] **v2.2**: App-scoped overlay (`shieldedPackage`), non-freezing `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL` window flags, Home Launcher immunity (`com.alhaq.amniquist`), and strict separation of `CURTAIN_SHIELD` from 3-strike lockouts.
-- [x] **v2.3 (Current — Multi-Crop Vision, Lazy-Load Verification & Video Heartbeat)**:
+- [x] **v2.3 (Multi-Crop Vision, Lazy-Load Verification & Video Heartbeat)**:
   - Implemented dynamic tensor inspection (`inputTensor` / `outputTensor`) and MobileNetV2 RGB `[0.0f, 1.0f]` / `UINT8` preprocessing.
-  - Added `sexy [4]` (`0.85x` weight, dashboard-configurable) + `neutral + drawings > 0.78f` safe-UI guard in 5-class NSFW scoring.
+  - Added `sexy [4]` (`0.85x` weight, dashboard-configurable) + safe-UI guard in 5-class NSFW scoring.
   - Replaced full-screen squishing with 3 square `224x224` active-content crops (Center, Upper-Middle, Lower-Middle) extracted from a proportional `360px` copy.
-  - Recalibrated sensitivity thresholds (`25% -> 0.62`, `50% -> 0.50`, `75% -> 0.38`, `95% -> 0.28`).
   - Added two-stage post-scroll scanning (`180ms` + `900ms`) for lazy-loaded images and a `1,500ms` active video heartbeat scanner.
   - Added dynamic `PackageManager` browser discovery (`MATCH_ALL`) and expanded gallery/search/social media coverage.
-- [x] **v2.0 Release (`versionCode = 2`, `versionName = "2.0"` — Dual Master Toggles, HaramBlur Regional Engine & Protected In-App Browser Hub)**:
-  - **Module 1 & Module 2 Dual Master Toggles (`MainDashboardScreen.kt` & `HaramBlurDashboardSection.kt`)**:
-    - **Master Toggle 1 (`isExplicitBlockerEnabled`)**: Collapsible settings dropdown for the 3-Layer Accessibility Explicit & Adult Content Blocker.
-    - **Master Toggle 2 (`isHaramBlurEnabled`)**: Collapsible settings dropdown for the **HaramBlur Real-Time Regional Face & Figure Blurring Engine** (`HaramBlurProjectionService` + `RegionalBlurOverlayView` + `AntiFlickerRegionTracker`), with 3-step setup strip, `System-Wide` vs `Selected Apps Only (Auto-Run Mode)`, `Who to Blur` (`Female`, `Male`, `Both`), `Low / Medium / High` sensitivity cards, and 5 `Overlay Styles` (`Blur`, `Pixelate`, `Black`, `Gray`, `Skin`) + `Effect Strength (1–10)`.
-  - **Anti-Flicker Exterior Pixel-Diff Lock (`HaramBlurEngineLogic.kt`)**: Samples a `16x16` exterior luminance grid strictly outside active blur boxes (`< 0.04f` stationary lock + `350ms` TTL + coordinate lerp) and clears immediately on `TYPE_VIEW_SCROLLED` or app switches so regional blur boxes never unblur/re-blur in a self-occlusion loop.
-  - **Dual Top-Level Protection Modes (`ProtectionModeScreen.kt`, `SettingsScreen.kt`, `ConnectedPlatformsScreen.kt`, `InAppBrowserScreen.kt`, `WebViewModerationBridge.kt`)**:
-    - **System-Wide Protection Mode**: Protects all installed apps on the device via Module 1 + Module 2, with a quick-launch card to open the Protected In-App Browser Hub at any time.
-    - **In-App Protection Mode**: Full-screen Protected `WebView` Social & Browser Hub for `Facebook`, `Instagram`, `YouTube`, `Google Search`, `X (Twitter)`, `LinkedIn`, and custom platforms—requiring zero `MediaProjection` or `Accessibility` permissions, with `480px` viewport capture, 120Hz DOM-locked CSS blur/pixelate/color filters, `Feed Control` (hide Shorts/Reels/Explore/Sponsored), `Default App Links`, pinned launcher shortcuts (`ShortcutManagerCompat`), daily `Usage & Time Limits`, and a **4-Digit Parental Control PIN**.
+- [x] **v2.4 (Current — 100% Opaque Regional Blur, Zero UI False Positives & Grid/Body Precision Pass)**:
+  - **100% Solid Opaque Regional Blur (`RegionalBlurOverlayView.kt` & `HaramBlurProjectionService.kt`)**: Eliminated see-through vertical stripes and translucent alpha (`< 255`); rendered real `8x8` clean-frame `previewPatch` mosaic tiles (`12dp..38dp`, `gap = 0f`, desaturated skin tones over `#FF0F172A`) and frosted upscaled patches (`Paint.FILTER_BITMAP_FLAG` + dark tint over `#FF1E293B`) with safe bitmap recycling and stationary locked-patch retention.
+  - **Clean Reference Frame Protection (`HaramBlurProjectionService.kt`)**: Clipped out `currentLockedRects` before updating `lastCleanFrameBitmap` so drawn overlay boxes are never burned into the reference frame.
+  - **Zero UI/Text False Positives (`ContentModerationEngine.kt`)**: Routed 5-class NSFW scoring exclusively to `QUANTIZED_NSFW`, added `skinRatio < 0.045f` pre-inference short-circuit, `skinRatio < 0.05f` media presence gate, `neutral + drawings >= 0.50f` safe-UI guard, and recalibrated strict sensitivity thresholds (`20% -> 0.78` down to `95% -> 0.38`).
+  - **Unanchored Grid & Body Detection (`ContentModerationEngine.kt` & `HaramBlurEngineLogic.kt`)**: Stopped running `GENDER_FILTER` on face-free grid cells (`isGridCell == true`) so background walls are never misclassified as `FEMALE` and face-free lingerie/body tiles are never vetoed as `MALE`; added tight `16x16` skin-contour bounding box refinement (`+8%` padding) and single-person adjacent box merging (`gridCellsTriggered <= 3`).
+  - **Dual Top-Level Protection Modes (`InAppProtectionScreens.kt`, `WebViewModerationBridge.kt`)**: System-Wide Protection Mode + Protected In-App `WebView` Browser Hub with 100% opaque `blur(28px) brightness(0.22) contrast(0.4)` + `#1E293B` pseudo-element backdrop. See [ARCHITECTURE.md](file:///home/habib/PROJECTS/Amni/AmnHaze-Android/ARCHITECTURE.md) and [walkthrough.md](file:///home/habib/PROJECTS/Amni/AmnHaze-Android/walkthrough.md) for full details.
 
