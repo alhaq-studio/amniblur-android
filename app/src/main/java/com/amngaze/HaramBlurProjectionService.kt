@@ -328,12 +328,31 @@ class HaramBlurProjectionService : Service() {
                 }
             }
 
-            // Cache current clean/restored frame for next cycle's unoccluded patch restoration
+            // Cache current clean/restored frame for next cycle's unoccluded patch restoration.
+            // Never copy pixels inside currentLockedRects so drawn overlay boxes are never burned into the clean reference frame.
             if (lastCleanFrameBitmap == null || lastCleanFrameBitmap?.isRecycled == true) {
                 lastCleanFrameBitmap = frameBitmap.copy(Bitmap.Config.ARGB_8888, true)
             } else {
+                val bw = frameBitmap.width.toFloat()
+                val bh = frameBitmap.height.toFloat()
                 patchRestoreCanvas.setBitmap(lastCleanFrameBitmap!!)
+                val saveCount = patchRestoreCanvas.save()
+                for (normRect in currentLockedRects) {
+                    val l = (normRect.left * bw).coerceIn(0f, bw)
+                    val t = (normRect.top * bh).coerceIn(0f, bh)
+                    val r = (normRect.right * bw).coerceIn(l, bw)
+                    val b = (normRect.bottom * bh).coerceIn(t, bh)
+                    if (r > l && b > t) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            patchRestoreCanvas.clipOutRect(l, t, r, b)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            patchRestoreCanvas.clipRect(l, t, r, b, android.graphics.Region.Op.DIFFERENCE)
+                        }
+                    }
+                }
                 patchRestoreCanvas.drawBitmap(frameBitmap, 0f, 0f, null)
+                patchRestoreCanvas.restoreToCount(saveCount)
             }
 
             // Continue scanning for newly playing video frames or grid cells unless the entire
@@ -360,9 +379,51 @@ class HaramBlurProjectionService : Service() {
                 lockedRegionIds = lockedRegionIds
             )
 
+            // Attach downscaled 8x8 previewPatch from clean reference frame for PIXELATE / BLUR styles.
+            // If a locked region already has a valid unrecycled previewPatch, keep its existing clean patch
+            // so stationary locked regions never overwrite their clean preview with the drawn overlay.
+            val regionsWithPatches = if (updatedRegions.isNotEmpty() &&
+                (overlayStyle == HaramBlurOverlayStyle.BLUR || overlayStyle == HaramBlurOverlayStyle.PIXELATE)
+            ) {
+                val bw = frameBitmap.width
+                val bh = frameBitmap.height
+                val cleanRef = lastCleanFrameBitmap
+                val cleanSource = if (cleanRef != null && !cleanRef.isRecycled) cleanRef else frameBitmap
+                updatedRegions.map { reg ->
+                    val existingPatch = reg.previewPatch
+                    if (existingPatch != null && !existingPatch.isRecycled && reg.id in lockedRegionIds) {
+                        reg
+                    } else {
+                        val cropL = (reg.rectF.left * bw).toInt().coerceIn(0, bw - 2)
+                        val cropT = (reg.rectF.top * bh).toInt().coerceIn(0, bh - 2)
+                        val cropR = (reg.rectF.right * bw).toInt().coerceIn(cropL + 2, bw)
+                        val cropB = (reg.rectF.bottom * bh).toInt().coerceIn(cropT + 2, bh)
+                        val w = cropR - cropL
+                        val h = cropB - cropT
+                        val patch = try {
+                            if (w > 4 && h > 4) {
+                                val sub = Bitmap.createBitmap(cleanSource, cropL, cropT, w, h)
+                                val scaled = Bitmap.createScaledBitmap(sub, 8, 8, true)
+                                if (sub !== cleanSource && !sub.isRecycled) {
+                                    sub.recycle()
+                                }
+                                scaled
+                            } else null
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        reg.copy(previewPatch = patch)
+                    }
+                }
+            } else {
+                updatedRegions
+            }
+
+            regionTracker.replaceActiveRegions(regionsWithPatches)
+
             mainHandler.post {
-                HaramBlurRuntimeBus.updateActiveRegions(updatedRegions)
-                regionalWindowManager.renderRegions(updatedRegions, overlayStyle, effectStrength)
+                HaramBlurRuntimeBus.updateActiveRegions(regionsWithPatches)
+                regionalWindowManager.renderRegions(regionsWithPatches, overlayStyle, effectStrength)
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Error processing HaramBlur projection frame", t)

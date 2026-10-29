@@ -285,12 +285,12 @@ class WebViewModerationBridge(
 
                     var styleEl = document.createElement('style');
                     styleEl.id = '__amngaze_feed_style';
-                    styleEl.innerHTML = '$feedCss html.__amngaze-clean-capture [data-amngaze-verdict="PREBLUR"] { filter: none !important; transition: none !important; }';
+                    styleEl.innerHTML = '$feedCss [data-amngaze-verdict="BLURRED"] { position: relative !important; background-color: #1E293B !important; opacity: 1 !important; } [data-amngaze-verdict="BLURRED"]::before { content: ""; position: absolute; inset: 0; background-color: #1E293B; pointer-events: none; z-index: 9999; } html.__amngaze-clean-capture [data-amngaze-verdict="PREBLUR"] { filter: none !important; transition: none !important; }';
                     (document.head || document.documentElement).appendChild(styleEl);
 
                     window.__amngazeUpdateFeedCss = function(cssText) {
                         var el = document.getElementById('__amngaze_feed_style');
-                        if (el) el.innerHTML = cssText + ' html.__amngaze-clean-capture [data-amngaze-verdict="PREBLUR"] { filter: none !important; transition: none !important; }';
+                        if (el) el.innerHTML = cssText + ' [data-amngaze-verdict="BLURRED"] { position: relative !important; background-color: #1E293B !important; opacity: 1 !important; } [data-amngaze-verdict="BLURRED"]::before { content: ""; position: absolute; inset: 0; background-color: #1E293B; pointer-events: none; z-index: 9999; } html.__amngaze-clean-capture [data-amngaze-verdict="PREBLUR"] { filter: none !important; transition: none !important; }';
                     };
 
                     window.__amngazePrepareCleanCapture = function() {
@@ -308,49 +308,23 @@ class WebViewModerationBridge(
                     };
 
                     function applyOverlayStyle(el, styleName, px) {
-                        var clampedPx = Math.max(1, Math.min(20, px || 10));
-                        var strength10 = Math.max(1, Math.min(10, Math.round(clampedPx / 2)));
-                        var isSolidOpaque = (strength10 >= 9);
-                        var blurPx = Math.max(6, Math.round(clampedPx * 2.2));
-                        var dimBrightness = isSolidOpaque ? 0.0 : Math.max(0.08, 1.0 - (strength10 * 0.085));
-                        var contrastFactor = isSolidOpaque ? 0.0 : Math.max(0.15, 1.0 - (strength10 * 0.075));
-
+                        el.style.opacity = '1';
                         if (styleName === 'BLACK') {
-                            if (isSolidOpaque) {
-                                el.style.filter = 'brightness(0) contrast(0)';
-                            } else {
-                                el.style.filter = 'blur(' + blurPx + 'px) brightness(' + (dimBrightness * 0.4) + ')';
-                            }
+                            el.style.filter = 'brightness(0) contrast(0)';
                             el.style.backgroundColor = '#000000';
                         } else if (styleName === 'GRAY') {
-                            if (isSolidOpaque) {
-                                el.style.filter = 'brightness(0) invert(0.56)';
-                            } else {
-                                el.style.filter = 'blur(' + blurPx + 'px) grayscale(1) contrast(' + contrastFactor + ') brightness(' + (0.45 + dimBrightness * 0.3) + ')';
-                            }
-                            el.style.backgroundColor = '#8E8E93';
+                            el.style.filter = 'brightness(0) invert(0.45)';
+                            el.style.backgroundColor = '#64748B';
                         } else if (styleName === 'SKIN') {
-                            if (isSolidOpaque) {
-                                el.style.filter = 'brightness(0) invert(0.82) sepia(0.35)';
-                            } else {
-                                el.style.filter = 'blur(' + blurPx + 'px) sepia(0.55) contrast(' + contrastFactor + ')';
-                            }
-                            el.style.backgroundColor = '#E8BEAC';
+                            el.style.filter = 'brightness(0) invert(0.80) sepia(0.35)';
+                            el.style.backgroundColor = '#D4A373';
                         } else if (styleName === 'PIXELATE') {
-                            if (isSolidOpaque) {
-                                el.style.filter = 'brightness(0) invert(0.12)';
-                            } else {
-                                el.style.filter = 'blur(' + blurPx + 'px) contrast(' + (1.2 + (10 - strength10) * 0.05) + ') brightness(' + dimBrightness + ')';
-                            }
+                            el.style.filter = 'blur(28px) brightness(0.22) contrast(0.4)';
                             el.style.backgroundColor = '#0F172A';
                         } else {
-                            // BLUR style: scales from translucent blur at 1/10 up to 100% solid opaque at 9..10/10
-                            if (isSolidOpaque) {
-                                el.style.filter = 'brightness(0) invert(0.14)';
-                            } else {
-                                el.style.filter = 'blur(' + blurPx + 'px) contrast(' + contrastFactor + ') brightness(' + dimBrightness + ')';
-                            }
-                            el.style.backgroundColor = '#182232';
+                            // BLUR style: 100% opaque blur filter paired with dark slate backdrop
+                            el.style.filter = 'blur(28px) brightness(0.22) contrast(0.4)';
+                            el.style.backgroundColor = '#1E293B';
                         }
                         el.style.transition = 'filter 0.10s ease-out';
                     }

@@ -31,7 +31,8 @@ data class TrackedBlurRegion(
     val rectF: RectF,
     val gender: DetectedGender,
     val confidence: Float,
-    val lastMatchedTimeMs: Long
+    val lastMatchedTimeMs: Long,
+    val previewPatch: Bitmap? = null
 )
 
 /**
@@ -56,6 +57,8 @@ object HaramBlurFilterLogic {
      *    - When `FEMALE` is selected, NEVER blurs verified `MALE` faces, figures, or exposed skin.
      *    - When `MALE` is selected, NEVER blurs verified `FEMALE` faces, figures, or exposed skin.
      *    - When `BOTH` is selected, blurs faces, figures, and exposed skin for both genders.
+     * 3. Grid Cell / Body Region Without a Face ([CandidateBlurBox.gender] == `UNKNOWN`):
+     *    - Only blurs when neural 5-class NSFW model detects nudity, lingerie, or revealing body skin.
      */
     fun shouldBlurCandidate(
         candidate: CandidateBlurBox,
@@ -68,7 +71,14 @@ object HaramBlurFilterLogic {
             return true
         }
 
-        // 2. Strict gender isolation for face, figure, and exposed skin
+        // Case 2: Grid Cell or Body Region Without a Face (gender == UNKNOWN)
+        if (candidate.gender == DetectedGender.UNKNOWN) {
+            val bodyVisualScore = candidate.explicitPornNudityConfidence + candidate.revealingSkinConfidence
+            return bodyVisualScore >= max(0.42f, sensitivity.threshold) &&
+                (candidate.revealingSkinConfidence >= 0.25f || candidate.explicitPornNudityConfidence >= 0.35f)
+        }
+
+        // Case 1: Localized Face Anchor or verified gender candidate
         return when (targetGender) {
             HaramBlurTargetGender.FEMALE -> {
                 when (candidate.gender) {
@@ -78,11 +88,9 @@ object HaramBlurFilterLogic {
                             candidate.genderConfidence,
                             max(candidate.revealingSkinConfidence, candidate.nsfwConfidence)
                         )
-                        effectiveConf >= sensitivity.threshold
+                        effectiveConf >= max(0.62f, sensitivity.threshold)
                     }
-                    DetectedGender.UNKNOWN -> {
-                        candidate.nsfwConfidence >= max(0.68f, sensitivity.threshold + 0.12f)
-                    }
+                    DetectedGender.UNKNOWN -> false
                 }
             }
             HaramBlurTargetGender.MALE -> {
@@ -93,11 +101,9 @@ object HaramBlurFilterLogic {
                             candidate.genderConfidence,
                             max(candidate.revealingSkinConfidence, candidate.nsfwConfidence)
                         )
-                        effectiveConf >= sensitivity.threshold
+                        effectiveConf >= max(0.62f, sensitivity.threshold)
                     }
-                    DetectedGender.UNKNOWN -> {
-                        candidate.nsfwConfidence >= max(0.68f, sensitivity.threshold + 0.12f)
-                    }
+                    DetectedGender.UNKNOWN -> false
                 }
             }
             HaramBlurTargetGender.BOTH -> {
@@ -105,7 +111,7 @@ object HaramBlurFilterLogic {
                     candidate.genderConfidence,
                     max(candidate.revealingSkinConfidence, candidate.nsfwConfidence)
                 )
-                effectiveConf >= sensitivity.threshold
+                effectiveConf >= max(0.58f, sensitivity.threshold)
             }
         }
     }
@@ -225,12 +231,11 @@ object HaramBlurFilterLogic {
     }
 
     /**
-     * Scales Effect Strength (`1..10`) linearly from `8dp` at 1 up to `36dp` at 10.
+     * Scales Effect Strength (`1..10`) linearly from `12dp` at 1 up to `38dp` at 10.
      */
     fun computePixelationBlockSizeDp(effectStrength: Int): Float {
         val clamped = effectStrength.coerceIn(1, 10)
-        // 1 -> 8dp, 10 -> 36dp
-        return 8f + ((clamped - 1) / 9f) * 28f
+        return 12f + ((clamped - 1) / 9f) * 26f
     }
 
     /**
@@ -242,36 +247,23 @@ object HaramBlurFilterLogic {
     }
 
     /**
-     * Maps Effect Strength (`1..10`) to an opacity alpha value (`115..255`) controlling
-     * transparency vs. solidness. At `9/10` and `10/10`, returns `255` (100% solid opaque,
-     * zero see-through).
+     * Returns 100% solid opaque alpha (`255`) across all Effect Strength levels (`1..10`)
+     * to eliminate see-through bleed-through on physical devices.
      */
     fun computeOverlayAlpha(effectStrength: Int): Int {
-        return when (effectStrength.coerceIn(1, 10)) {
-            1 -> 115
-            2 -> 136
-            3 -> 156
-            4 -> 176
-            5 -> 196
-            6 -> 214
-            7 -> 230
-            8 -> 244
-            9 -> 255
-            else -> 255
-        }
+        return 255
     }
 
     /**
-     * Returns the user-facing solidness percentage (`45%..100%`) for a given Effect Strength (`1..10`).
+     * Returns 100% solidness percentage across all Effect Strength levels (`1..10`).
      */
     fun computeOverlaySolidnessPercent(effectStrength: Int): Int {
-        val alpha = computeOverlayAlpha(effectStrength)
-        return ((alpha * 100 + 127) / 255).coerceIn(45, 100)
+        return 100
     }
 
     /**
      * Maps Effect Strength (`1..10`) to a normalized density factor (`0.0f..1.0f`) controlling
-     * multi-band frosted diffusion layers and mosaic tile packing density.
+     * mosaic tile coarseness and blur downscaling.
      */
     fun computeDensityFactor(effectStrength: Int): Float {
         val clamped = effectStrength.coerceIn(1, 10)
@@ -279,26 +271,24 @@ object HaramBlurFilterLogic {
     }
 
     /**
-     * Returns the base ARGB color integer for the given [HaramBlurOverlayStyle].
+     * Returns the 100% solid opaque ARGB color integer for the given [HaramBlurOverlayStyle].
      */
     fun overlayColorArgb(style: HaramBlurOverlayStyle): Int {
         return when (style) {
-            HaramBlurOverlayStyle.BLUR -> 0xD91E293B.toInt()
-            HaramBlurOverlayStyle.PIXELATE -> 0xE60F172A.toInt()
+            HaramBlurOverlayStyle.BLUR -> 0xFF1E293B.toInt()
+            HaramBlurOverlayStyle.PIXELATE -> 0xFF0F172A.toInt()
             HaramBlurOverlayStyle.BLACK -> 0xFF000000.toInt()
-            HaramBlurOverlayStyle.GRAY -> 0xFF8E8E93.toInt()
-            HaramBlurOverlayStyle.SKIN -> 0xFFE8BEAC.toInt()
+            HaramBlurOverlayStyle.GRAY -> 0xFF64748B.toInt()
+            HaramBlurOverlayStyle.SKIN -> 0xFFD4A373.toInt()
         }
     }
 
     /**
-     * Returns the strength-adjusted ARGB color integer where alpha is scaled by [effectStrength] (`1..10`),
-     * reaching `0xFF` (`255` — 100% solid opaque) at strengths `9` and `10`.
+     * Returns the 100% solid opaque (`alpha = 255`) ARGB color integer across all strength levels `1..10`.
      */
     fun overlayColorArgb(style: HaramBlurOverlayStyle, effectStrength: Int): Int {
-        val alpha = computeOverlayAlpha(effectStrength)
         val rgb = overlayColorArgb(style) and 0x00FFFFFF
-        return (alpha shl 24) or rgb
+        return (255 shl 24) or rgb
     }
 }
 
@@ -324,6 +314,12 @@ class AntiFlickerRegionTracker(
 
     @Synchronized
     fun getActiveRegions(): List<TrackedBlurRegion> = activeRegions.toList()
+
+    @Synchronized
+    fun replaceActiveRegions(regions: List<TrackedBlurRegion>) {
+        activeRegions.clear()
+        activeRegions.addAll(regions)
+    }
 
     @Synchronized
     fun clearAll() {

@@ -33,7 +33,7 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2f * resources.displayMetrics.density
-        color = Color.argb(110, 255, 255, 255)
+        color = Color.argb(255, 71, 85, 105)
     }
     private val screenRect = RectF()
 
@@ -42,17 +42,36 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
     }
     private val clipPath = android.graphics.Path()
 
+    private val filterBitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
     fun updateBoxes(
-        regions: List<TrackedBlurRegion>,
+        newBoxes: List<TrackedBlurRegion>,
         style: HaramBlurOverlayStyle,
         strength: Int
     ) {
+        for (old in activeRegions) {
+            val oldPatch = old.previewPatch
+            if (oldPatch != null && !oldPatch.isRecycled && newBoxes.none { it.previewPatch === oldPatch }) {
+                oldPatch.recycle()
+            }
+        }
         activeRegions.clear()
-        activeRegions.addAll(regions)
+        activeRegions.addAll(newBoxes)
         overlayStyle = style
         effectStrength = strength.coerceIn(1, 10)
         visibility = if (activeRegions.isEmpty()) GONE else VISIBLE
         invalidate()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        for (reg in activeRegions) {
+            val patch = reg.previewPatch
+            if (patch != null && !patch.isRecycled) {
+                patch.recycle()
+            }
+        }
+        activeRegions.clear()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -65,8 +84,6 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
 
         val density = resources.displayMetrics.density
         val cornerRadius = 14f * density
-        val alpha = HaramBlurFilterLogic.computeOverlayAlpha(effectStrength)
-        val densityFactor = HaramBlurFilterLogic.computeDensityFactor(effectStrength)
 
         for (region in activeRegions) {
             screenRect.set(
@@ -81,32 +98,33 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                 HaramBlurOverlayStyle.BLACK,
                 HaramBlurOverlayStyle.GRAY,
                 HaramBlurOverlayStyle.SKIN -> {
-                    // Scales solidness vs. transparency from 1/10 (alpha=115) up to 9..10/10 (alpha=255, 100% solid)
+                    // 100% solid opaque (alpha = 255) rounded rect (#FF000000, #FF64748B, #FFD4A373)
                     boxFillPaint.color = HaramBlurFilterLogic.overlayColorArgb(overlayStyle, effectStrength)
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
-                    if (alpha < 255) {
-                        canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, borderPaint)
-                    }
+                    canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, borderPaint)
                 }
 
                 HaramBlurOverlayStyle.PIXELATE -> {
-                    // 1. Solid backing fill scaled by alpha (reaches 255 = 100% opaque at 9..10/10 so nothing bleeds through)
-                    boxFillPaint.color = Color.argb(alpha, 15, 23, 42)
+                    // 1. Solid backing fill 100% opaque alpha = 255 (#FF0F172A)
+                    boxFillPaint.color = 0xFF0F172A.toInt()
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
 
-                    // 2. Dense mosaic grid where higher strength increases tile opacity and packing density
-                    //    (tile gaps shrink to 0f at >= 8/10 so nothing bleeds through)
-                    val denseBlockDp = (26f - densityFactor * 14f).coerceIn(10f, 26f)
-                    val blockSizePx = max(10f, denseBlockDp * density)
-                    val tileGapPx = if (effectStrength >= 8) {
-                        0f
-                    } else {
-                        ((1f - densityFactor) * 2.2f * density).coerceAtLeast(0.5f)
-                    }
+                    // 2. Mosaic grid whose tile size scales with Effect Strength (1..10) (12dp at 1 up to 38dp at 10)
+                    //    Zero gaps (gap = 0f), drawn at alpha = 255
+                    val blockSizeDp = HaramBlurFilterLogic.computePixelationBlockSizeDp(effectStrength)
+                    val blockSizePx = max(10f, blockSizeDp * density)
+
                     val saveCount = canvas.save()
                     clipPath.reset()
                     clipPath.addRoundRect(screenRect, cornerRadius, cornerRadius, android.graphics.Path.Direction.CW)
                     canvas.clipPath(clipPath)
+
+                    val patch = region.previewPatch
+                    val hasValidPatch = patch != null && !patch.isRecycled
+                    val patchW = if (hasValidPatch) patch!!.width else 1
+                    val patchH = if (hasValidPatch) patch!!.height else 1
+                    val rectW = screenRect.width().coerceAtLeast(1f)
+                    val rectH = screenRect.height().coerceAtLeast(1f)
 
                     var row = 0
                     var y = screenRect.top
@@ -114,16 +132,47 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                         var col = 0
                         var x = screenRect.left
                         val nextY = (y + blockSizePx).coerceAtMost(screenRect.bottom)
-                        val drawBottom = (nextY - tileGapPx).coerceAtLeast(y + 1f)
                         while (x < screenRect.right) {
                             val nextX = (x + blockSizePx).coerceAtMost(screenRect.right)
-                            val drawRight = (nextX - tileGapPx).coerceAtLeast(x + 1f)
-                            mosaicBlockPaint.color = when ((row * 3 + col * 5) % 3) {
-                                0 -> Color.argb(alpha, 30, 41, 59)
-                                1 -> Color.argb(alpha, 51, 65, 85)
-                                else -> Color.argb(alpha, 39, 52, 73)
+                            if (hasValidPatch) {
+                                val u = ((x + nextX) * 0.5f - screenRect.left) / rectW
+                                val v = ((y + nextY) * 0.5f - screenRect.top) / rectH
+                                val px = (u * patchW).toInt().coerceIn(0, patchW - 1)
+                                val py = (v * patchH).toInt().coerceIn(0, patchH - 1)
+                                val sampleColor = try {
+                                    patch!!.getPixel(px, py)
+                                } catch (_: Throwable) {
+                                    0xFF1E293B.toInt()
+                                }
+
+                                val r = (sampleColor shr 16) and 0xFF
+                                val g = (sampleColor shr 8) and 0xFF
+                                val b = sampleColor and 0xFF
+                                val luma = (0.299f * r + 0.587f * g + 0.114f * b).toInt()
+                                val isSkin = ContentModerationEngine.isSkinPixel(sampleColor)
+                                val finalR: Int
+                                val finalG: Int
+                                val finalB: Int
+                                if (isSkin) {
+                                    // Desaturate/clamp skin tones into neutral dark-slate/frosted palette
+                                    finalR = (22 + (luma * 0.20f)).toInt().coerceIn(15, 65)
+                                    finalG = (32 + (luma * 0.24f)).toInt().coerceIn(22, 80)
+                                    finalB = (48 + (luma * 0.30f)).toInt().coerceIn(35, 100)
+                                } else {
+                                    // Sample clean frame colors with slight desaturation
+                                    finalR = ((r * 0.55f) + (luma * 0.45f)).toInt().coerceIn(15, 180)
+                                    finalG = ((g * 0.55f) + (luma * 0.45f)).toInt().coerceIn(20, 180)
+                                    finalB = ((b * 0.55f) + (luma * 0.45f)).toInt().coerceIn(25, 195)
+                                }
+                                mosaicBlockPaint.color = Color.argb(255, finalR, finalG, finalB)
+                            } else {
+                                mosaicBlockPaint.color = when ((row * 3 + col * 5) % 3) {
+                                    0 -> Color.argb(255, 30, 41, 59)
+                                    1 -> Color.argb(255, 51, 65, 85)
+                                    else -> Color.argb(255, 39, 52, 73)
+                                }
                             }
-                            canvas.drawRect(x, y, drawRight, drawBottom, mosaicBlockPaint)
+                            canvas.drawRect(x, y, nextX, nextY, mosaicBlockPaint)
                             x = nextX
                             col++
                         }
@@ -135,29 +184,26 @@ class RegionalBlurOverlayView(context: Context) : View(context) {
                 }
 
                 HaramBlurOverlayStyle.BLUR -> {
-                    // 1. Primary frosted fill scaled by Effect Strength (1..10 -> alpha 115..255).
-                    //    At 9/10 and 10/10, alpha is 255 (100% solid opaque, zero see-through).
-                    boxFillPaint.color = Color.argb(alpha, 24, 34, 50)
+                    // 1. 255 opaque #FF1E293B backing rect
+                    boxFillPaint.color = 0xFF1E293B.toInt()
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, boxFillPaint)
 
-                    // 2. Multi-band frosted diffusion layers scaled by densityFactor (2..7 layers)
                     val saveCount = canvas.save()
                     clipPath.reset()
                     clipPath.addRoundRect(screenRect, cornerRadius, cornerRadius, android.graphics.Path.Direction.CW)
                     canvas.clipPath(clipPath)
 
-                    val layerCount = 2 + (densityFactor * 5f).toInt()
-                    val bandHeight = (screenRect.height() / layerCount.toFloat()).coerceAtLeast(6f)
-                    val layerAlpha = (45 + (densityFactor * 95f).toInt()).coerceIn(45, 140)
-                    for (i in 0 until layerCount) {
-                        val bandTop = screenRect.top + i * bandHeight
-                        val bandBottom = (bandTop + bandHeight).coerceAtMost(screenRect.bottom)
-                        frostLayerPaint.color = if (i % 2 == 0) {
-                            Color.argb(layerAlpha, 51, 65, 85)
-                        } else {
-                            Color.argb(layerAlpha, 30, 41, 59)
-                        }
-                        canvas.drawRect(screenRect.left, bandTop, screenRect.right, bandBottom, frostLayerPaint)
+                    val patch = region.previewPatch
+                    if (patch != null && !patch.isRecycled) {
+                        // Heavily downscaled patch upscaled with FILTER_BITMAP_FLAG
+                        canvas.drawBitmap(patch, null, screenRect, filterBitmapPaint)
+                        // Dark frosted tint overlay so no facial features or contours are ever visible
+                        frostLayerPaint.color = Color.argb(210, 20, 28, 42)
+                        canvas.drawRect(screenRect, frostLayerPaint)
+                    } else {
+                        // Solid dark frosted texture without patch
+                        frostLayerPaint.color = Color.argb(255, 30, 41, 59)
+                        canvas.drawRect(screenRect, frostLayerPaint)
                     }
                     canvas.restoreToCount(saveCount)
                     canvas.drawRoundRect(screenRect, cornerRadius, cornerRadius, borderPaint)

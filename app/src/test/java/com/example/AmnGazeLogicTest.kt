@@ -154,41 +154,49 @@ class AmnGazeLogicTest {
         assertFalse(scanner.containsBlockedTerm("Hide NSFW content toggle in settings", isUrlBarNode = false))
         assertFalse(scanner.containsBlockedTerm("Order #XXX-12345 shipped. Check av.net status in app.", isUrlBarNode = false))
         assertFalse(scanner.containsBlockedTerm("https://developer.android.com/reference/android/accessibilityservice/AccessibilityService", isUrlBarNode = true))
-        assertEquals(0.50f, ContentModerationEngine.confidenceThresholdForSensitivity(0.5f), 0.001f)
+        assertEquals(0.60f, ContentModerationEngine.confidenceThresholdForSensitivity(0.5f), 0.001f)
     }
 
     @Test
     fun testFiveClassNsfwScoringAndSafeUiGuard() {
         // [0]=drawings, [1]=hentai, [2]=neutral, [3]=porn, [4]=sexy
 
-        // 1. Plain text UI / settings screen where neutral + drawings > 0.78f -> SAFE (0.0f)
-        val safeUiProbs = floatArrayOf(0.15f, 0.02f, 0.70f, 0.05f, 0.08f) // neutral + drawings = 0.85f > 0.78f
+        // 1. Plain text UI / settings screen where neutral + drawings >= 0.50f -> SAFE (0.0f)
+        val safeUiProbs = floatArrayOf(0.15f, 0.02f, 0.70f, 0.05f, 0.08f) // neutral + drawings = 0.85f >= 0.50f
         assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(safeUiProbs, includeSexyScore = true), 0.001f)
 
         // 2. Real-world nudity / revealing frame splitting probability between porn (0.30) and sexy (0.50)
-        //    explicitScore = 0.30 + 0.05 = 0.35
-        //    combinedNsfwScore = 0.30 + 0.05 + (0.50 * 0.85) = 0.775
+        //    hentaiProb (0.05f < 0.65f) is suppressed as UI noise -> explicitScore = pornProb = 0.30f
+        //    combinedNsfwScore = 0.30 + (0.50 * 0.85) = 0.725f
         val splitNsfwProbs = floatArrayOf(0.03f, 0.05f, 0.12f, 0.30f, 0.50f)
         assertEquals(
-            0.775f,
+            0.725f,
             ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = true),
             0.001f
         )
-        // When user disables revealing/sexy class, only porn + hentai (0.35) is counted
+        // When user disables revealing/sexy class, only porn (0.30) is counted
         assertEquals(
-            0.35f,
+            0.30f,
             ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = false),
+            0.001f
+        )
+
+        // 3. Low skin-tone ratio (< 5%) on non-blatant porn always returns SAFE (0.0f)
+        assertEquals(
+            0.0f,
+            ContentModerationEngine.computeFiveClassNsfwScore(splitNsfwProbs, includeSexyScore = true, skinRatio = 0.03f),
             0.001f
         )
     }
 
     @Test
     fun testSensitivitySliderThresholdMapping() {
-        // 25% -> 0.62f, 50% -> 0.50f, 75% -> 0.38f, 95% -> 0.28f
-        assertEquals(0.62f, ContentModerationEngine.confidenceThresholdForSensitivity(0.25f), 0.005f)
-        assertEquals(0.50f, ContentModerationEngine.confidenceThresholdForSensitivity(0.50f), 0.005f)
-        assertEquals(0.38f, ContentModerationEngine.confidenceThresholdForSensitivity(0.75f), 0.005f)
-        assertEquals(0.28f, ContentModerationEngine.confidenceThresholdForSensitivity(0.95f), 0.005f)
+        // 20% -> 0.78f, 25% -> 0.74f, 50% -> 0.60f, 75% -> 0.48f, 95% -> 0.38f
+        assertEquals(0.78f, ContentModerationEngine.confidenceThresholdForSensitivity(0.20f), 0.005f)
+        assertEquals(0.74f, ContentModerationEngine.confidenceThresholdForSensitivity(0.25f), 0.005f)
+        assertEquals(0.60f, ContentModerationEngine.confidenceThresholdForSensitivity(0.50f), 0.005f)
+        assertEquals(0.48f, ContentModerationEngine.confidenceThresholdForSensitivity(0.75f), 0.005f)
+        assertEquals(0.38f, ContentModerationEngine.confidenceThresholdForSensitivity(0.95f), 0.005f)
     }
 
     @Test
@@ -371,9 +379,9 @@ class AmnGazeLogicTest {
         assertEquals(0.52f, HaramBlurSensitivity.MEDIUM.threshold, 0.001f)
         assertEquals(0.35f, HaramBlurSensitivity.HIGH.threshold, 0.001f)
 
-        // Effect strength 1..10 -> 8dp..36dp pixelation block size, 6px..42px blur radius
-        assertEquals(8f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.1f)
-        assertEquals(36f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.1f)
+        // Effect strength 1..10 -> 12dp..38dp pixelation block size, 6px..42px blur radius
+        assertEquals(12f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.1f)
+        assertEquals(38f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.1f)
         assertEquals(6f, HaramBlurFilterLogic.computeBlurRadiusPx(1), 0.1f)
         assertEquals(42f, HaramBlurFilterLogic.computeBlurRadiusPx(10), 0.1f)
 
@@ -629,31 +637,29 @@ class AmnGazeLogicTest {
 
     @Test
     fun testEffectStrengthSolidnessAndDensityCurveReachesOpaque255() = runBlocking {
-        // 1/10 is translucent (~45%, alpha=115)
-        assertEquals(115, HaramBlurFilterLogic.computeOverlayAlpha(1))
-        assertEquals(45, HaramBlurFilterLogic.computeOverlaySolidnessPercent(1))
-        assertEquals(0f, HaramBlurFilterLogic.computeDensityFactor(1), 0.001f)
+        // All strength levels 1..10 must be 100% solid opaque (alpha=255, zero see-through)
+        for (s in 1..10) {
+            assertEquals("Strength $s must be 100% opaque (alpha=255)", 255, HaramBlurFilterLogic.computeOverlayAlpha(s))
+            assertEquals(100, HaramBlurFilterLogic.computeOverlaySolidnessPercent(s))
+        }
 
-        // 5/10 is medium dense (~77%, alpha=196)
-        assertEquals(196, HaramBlurFilterLogic.computeOverlayAlpha(5))
-        assertTrue(HaramBlurFilterLogic.computeOverlayAlpha(5) > HaramBlurFilterLogic.computeOverlayAlpha(2))
-
-        // 9/10 and 10/10 are 100% solid opaque (alpha=255, zero see-through)
-        assertEquals(255, HaramBlurFilterLogic.computeOverlayAlpha(9))
-        assertEquals(255, HaramBlurFilterLogic.computeOverlayAlpha(10))
-        assertEquals(100, HaramBlurFilterLogic.computeOverlaySolidnessPercent(9))
-        assertEquals(100, HaramBlurFilterLogic.computeOverlaySolidnessPercent(10))
-        assertEquals(1f, HaramBlurFilterLogic.computeDensityFactor(10), 0.001f)
-
-        // Verify all overlay styles reach alpha 0xFF (255) at strength 10
+        // Verify all overlay styles have alpha 0xFF (255) across all strengths 1..10
         for (style in HaramBlurOverlayStyle.entries) {
-            val colorAt10 = HaramBlurFilterLogic.overlayColorArgb(style, 10)
-            val alphaAt10 = (colorAt10 ushr 24) and 0xFF
-            assertEquals("Style $style must be 100% opaque (alpha=255) at 10/10", 255, alphaAt10)
+            for (s in 1..10) {
+                val color = HaramBlurFilterLogic.overlayColorArgb(style, s)
+                val alpha = (color ushr 24) and 0xFF
+                assertEquals("Style $style must be 100% opaque (alpha=255) at strength $s", 255, alpha)
+            }
+        }
 
-            val colorAt1 = HaramBlurFilterLogic.overlayColorArgb(style, 1)
-            val alphaAt1 = (colorAt1 ushr 24) and 0xFF
-            assertEquals(115, alphaAt1)
+        // Verify computePixelationBlockSizeDp scales from 12dp at 1 up to 38dp at 10
+        assertEquals(12f, HaramBlurFilterLogic.computePixelationBlockSizeDp(1), 0.001f)
+        assertEquals(38f, HaramBlurFilterLogic.computePixelationBlockSizeDp(10), 0.001f)
+        for (s in 1..9) {
+            assertTrue(
+                "Block size must increase monotonically",
+                HaramBlurFilterLogic.computePixelationBlockSizeDp(s + 1) > HaramBlurFilterLogic.computePixelationBlockSizeDp(s)
+            )
         }
 
         // Verify ViewModel synchronizes 1..10 strength and 1..20px in-app strength
@@ -961,7 +967,7 @@ class AmnGazeLogicTest {
             ContentModerationEngine.resolveAdultBlockerModelType(ModerationModelType.QUANTIZED_NSFW)
         )
         assertEquals(
-            ModerationModelType.DEFAULT_NSFW,
+            ModerationModelType.QUANTIZED_NSFW,
             ContentModerationEngine.resolveAdultBlockerModelType(ModerationModelType.DEFAULT_NSFW)
         )
 
@@ -978,6 +984,148 @@ class AmnGazeLogicTest {
             engine.close()
             bmp.recycle()
         }
+    }
+
+    @Test
+    fun testTextAndUiCropsNeverFalseTriggerWithZeroSkinRatio() {
+        // High neutral/drawings (>= 0.50f) and low skin ratio (< 0.05f) returns 0.0f (SAFE)
+        val uiProbs = floatArrayOf(0.30f, 0.40f, 0.25f, 0.05f, 0.00f) // neutral + drawings = 0.55f >= 0.50f
+        assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(uiProbs, includeSexyScore = true, skinRatio = 0.01f), 0.001f)
+
+        // Hentai spike to 0.60f on UI page with neutral + drawings >= 0.50f returns 0.0f (SAFE)
+        val hentai60Ui = floatArrayOf(0.20f, 0.60f, 0.35f, 0.02f, 0.01f) // neutral + drawings = 0.55f >= 0.50f
+        assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(hentai60Ui, includeSexyScore = true, skinRatio = 0.06f), 0.001f)
+
+        // Hentai spike to 0.60f with skinRatio < 0.05f returns 0.0f (SAFE) even if neutral + drawings < 0.50f
+        val hentai60LowSkin = floatArrayOf(0.10f, 0.60f, 0.10f, 0.15f, 0.05f)
+        assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(hentai60LowSkin, includeSexyScore = true, skinRatio = 0.03f), 0.001f)
+
+        // Hentai spike without skin (skinRatio < 0.05f) returns SAFE
+        val hentaiSpikeProbs = floatArrayOf(0.10f, 0.70f, 0.15f, 0.05f, 0.00f)
+        assertEquals(0.0f, ContentModerationEngine.computeFiveClassNsfwScore(hentaiSpikeProbs, includeSexyScore = true, skinRatio = 0.02f), 0.001f)
+
+        // With skin (skinRatio >= 0.08f) and hentai >= 0.65f and neutral < 0.20f, hentai is counted
+        val realHentaiProbs = floatArrayOf(0.10f, 0.70f, 0.15f, 0.05f, 0.00f)
+        val score = ContentModerationEngine.computeFiveClassNsfwScore(realHentaiProbs, includeSexyScore = false, skinRatio = 0.12f)
+        assertTrue("Real hentai with skin must be detected: score=$score", score >= 0.70f)
+    }
+
+    @Test
+    fun testFaceFreeGridCellsNeverRunGenderFilterAndBlurOnRevealingSkin() {
+        val engine = ContentModerationEngine(context)
+        val wallBmp = android.graphics.Bitmap.createBitmap(80, 80, android.graphics.Bitmap.Config.ARGB_8888)
+        wallBmp.eraseColor(android.graphics.Color.rgb(40, 50, 60)) // Dark slate wall
+
+        try {
+            // Calling classifyCropForHaramBlur on a face-free background bitmap returns gender == UNKNOWN and shouldBlurCandidate == false
+            val wallCandidate = engine.classifyCropForHaramBlur(wallBmp, isGridCell = true)
+            assertEquals("Face-free background bitmap must have gender UNKNOWN", DetectedGender.UNKNOWN, wallCandidate.gender)
+            assertEquals(0f, wallCandidate.genderConfidence, 0.001f)
+            assertFalse(
+                "Face-free background cell must NOT be blurred in FEMALE mode",
+                HaramBlurFilterLogic.shouldBlurCandidate(wallCandidate, HaramBlurTargetGender.FEMALE, HaramBlurSensitivity.MEDIUM)
+            )
+            assertFalse(
+                "Face-free background cell must NOT be blurred in BOTH mode",
+                HaramBlurFilterLogic.shouldBlurCandidate(wallCandidate, HaramBlurTargetGender.BOTH, HaramBlurSensitivity.MEDIUM)
+            )
+        } finally {
+            engine.close()
+            wallBmp.recycle()
+        }
+
+        // 1. Grid cell without face anchor (isGridCell = true, gender = UNKNOWN)
+        val lingerieGridCell = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.33f, 0.08f, 0.66f, 0.38f),
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            nsfwConfidence = 0.15f,
+            explicitPornNudityConfidence = 0.15f,
+            revealingSkinConfidence = 0.62f,
+            isGridCell = true
+        )
+
+        // Must blur in FEMALE and BOTH mode even without a face, because revealingSkin >= 0.25f and bodyVisualScore >= 0.42f
+        assertTrue(
+            "Lingerie/body grid cell without face must be blurred in FEMALE mode",
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = lingerieGridCell,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+        assertTrue(
+            "Lingerie/body grid cell without face must be blurred in BOTH mode",
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = lingerieGridCell,
+                targetGender = HaramBlurTargetGender.BOTH,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+
+        // 2. Normal wall / background grid cell with zero skin and low porn
+        val safeBackgroundCell = CandidateBlurBox(
+            normalizedRect = android.graphics.RectF(0.02f, 0.08f, 0.33f, 0.38f),
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            nsfwConfidence = 0.02f,
+            explicitPornNudityConfidence = 0.02f,
+            revealingSkinConfidence = 0.00f,
+            isGridCell = true
+        )
+        assertFalse(
+            "Safe background grid cell must NOT be blurred",
+            HaramBlurFilterLogic.shouldBlurCandidate(
+                candidate = safeBackgroundCell,
+                targetGender = HaramBlurTargetGender.FEMALE,
+                sensitivity = HaramBlurSensitivity.MEDIUM
+            )
+        )
+    }
+
+    @Test
+    fun testTightSkinBoundingBoxAndAdjacentBoxMerging() {
+        // 1. Test tight bounding box on a 100x100 bitmap with a skin patch in the bottom-right quadrant
+        val bmp = android.graphics.Bitmap.createBitmap(100, 100, android.graphics.Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(android.graphics.Color.rgb(10, 10, 10)) // black background
+        val skinColor = android.graphics.Color.rgb(225, 165, 135)
+        for (y in 50 until 95) {
+            for (x in 50 until 95) {
+                bmp.setPixel(x, y, skinColor)
+            }
+        }
+
+        val cellRect = android.graphics.RectF(0.0f, 0.0f, 0.5f, 0.5f)
+        val tightBox = ContentModerationEngine.computeTightSkinBoundingBox(bmp, cellRect)
+        assertTrue("Tight box left must be >= cellRect left", tightBox.left >= cellRect.left)
+        assertTrue("Tight box top must be >= cellRect top", tightBox.top >= cellRect.top)
+        assertTrue("Tight box width must be smaller than full cell width", tightBox.width() < cellRect.width())
+        bmp.recycle()
+
+        // 2. Test shared edge overlap and merging
+        val boxA = android.graphics.RectF(0.20f, 0.10f, 0.80f, 0.45f)
+        val boxB = android.graphics.RectF(0.22f, 0.44f, 0.78f, 0.80f) // vertically adjacent with >50% horizontal overlap
+        assertTrue(ContentModerationEngine.hasSharedEdgeOverlap(boxA, boxB))
+
+        val candidateA = CandidateBlurBox(
+            normalizedRect = boxA,
+            gender = DetectedGender.FEMALE,
+            genderConfidence = 0.85f,
+            nsfwConfidence = 0.20f,
+            isGridCell = true
+        )
+        val candidateB = CandidateBlurBox(
+            normalizedRect = boxB,
+            gender = DetectedGender.UNKNOWN,
+            genderConfidence = 0f,
+            revealingSkinConfidence = 0.75f,
+            isGridCell = true
+        )
+
+        val merged = ContentModerationEngine.mergeAdjacentPersonBoxes(listOf(candidateA, candidateB))
+        assertEquals("Adjacent person boxes must merge into 1 single box", 1, merged.size)
+        assertEquals(DetectedGender.FEMALE, merged[0].gender)
+        assertTrue("Merged box should span from top of boxA to bottom of boxB", merged[0].normalizedRect.top <= 0.10f && merged[0].normalizedRect.bottom >= 0.80f)
     }
 }
 
